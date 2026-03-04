@@ -1,0 +1,1995 @@
+---
+title: "05 - Genomic Context and Coupling Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 7)
+```
+
+# Overview
+
+This notebook addresses two main analytical questions from the analysis plan:
+
+**Q5: ARG Genomic Context and Mobility/Lifestyle**
+- What fraction of ARGs reside on contigs, MAGs, plasmids, or viruses?
+- What is the plasmid mobility distribution (conjugative, mobilizable, non-mobilizable)?
+- What is the viral lifestyle distribution (temperate vs virulent)?
+- **Are ARGs enriched on mobile plasmids or temperate phages?**
+
+**Q6: Coupling Between Resistome and Community**
+- How tightly is resistome structure coupled to prokaryotic community structure?
+- Mantel test and Procrustes analysis
+
+---
+
+# Phase 1: Setup and Data Loading
+
+## Load Global Setup
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+
+OUT_DIR <- file.path(RESULTS_DIR, "05_genomic_context")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+cat("Output directory:", OUT_DIR, "\n")
+
+GE_DIR <- file.path(DATA_DIR, "00_reads/Genome_Equivalents_Summary")
+GE_SUMMARY_FILE <- file.path(GE_DIR, "ge_summary.csv")
+
+# Load GE Data Globally
+if (file.exists(GE_SUMMARY_FILE)) {
+  ge_df <- read.csv(GE_SUMMARY_FILE, stringsAsFactors = FALSE)
+} else {
+  ge_df <- NULL
+  warning("GE Summary file not found!")
+}
+
+# Helper to read Genome Equivalents (Robust)
+# Helper to read Genome Equivalents (Look up in loaded dataframe)
+get_genome_equivalents <- function(sample_name, ge_data = ge_df) {
+  if (is.null(ge_data)) {
+    return(NULL)
+  }
+
+  # Try exact match
+  row <- ge_data[ge_data$SampleID == sample_name, ]
+  if (nrow(row) == 0) {
+    return(NULL)
+  }
+
+  # Return formatting matching previous output
+  return(list(ge = row$Genome_Equivalents, rl = row$Read_Length))
+}
+```
+
+---
+
+# Phase 2: Viral Lifestyle Analysis (Q5.3)
+
+## Load DeepPhage Lifestyle Data
+
+```{r load_deephage}
+lifestyle_dir <- file.path(DATA_DIR, "04_Viruses/lifestyle")
+lifestyle_files <- list.files(lifestyle_dir, pattern = "_deephage\\.csv$", full.names = TRUE)
+
+cat("Found", length(lifestyle_files), "DeepPhage files\n")
+
+lifestyle_list <- lapply(lifestyle_files, function(f) {
+  sample_name <- gsub("_deephage\\.csv$", "", basename(f))
+  df <- fread(f)
+  df$Sample <- sample_name
+  return(df)
+})
+
+lifestyle_data <- rbindlist(lifestyle_list, fill = TRUE)
+
+# Standardize lifestyle categories
+lifestyle_data <- lifestyle_data %>%
+  mutate(
+    Lifestyle = case_when(
+      grepl("temperate", possible_lifestyle, ignore.case = TRUE) ~ "Temperate",
+      grepl("virulent|lytic", possible_lifestyle, ignore.case = TRUE) ~ "Virulent",
+      grepl("uncertain", possible_lifestyle, ignore.case = TRUE) ~ "Uncertain",
+      TRUE ~ "Unknown"
+    ),
+    VirusID = stringr::str_extract(Header, "NODE_\\d+_length_\\d+_cov_[0-9.]+") # Extract standard SPAdes ID
+  )
+
+# Calculate RPKG for Viruses
+# Extract coverage from Header (SPAdes format)
+lifestyle_data$coverage <- as.numeric(stringr::str_extract(lifestyle_data$Header, "(?<=cov_)[0-9.]+"))
+
+# Add RPKG
+lifestyle_data$RPKG <- 1 # Default
+lifestyle_data$Normalization <- "Count"
+
+unique_samples <- unique(lifestyle_data$Sample)
+for (s in unique_samples) {
+  ge_info <- get_genome_equivalents(s, ge_df)
+  if (!is.null(ge_info)) {
+    idx <- lifestyle_data$Sample == s
+    cov_vals <- lifestyle_data$coverage[idx]
+    cov_vals[is.na(cov_vals)] <- 1
+
+    rpkg_vals <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    lifestyle_data$RPKG[idx] <- rpkg_vals
+    lifestyle_data$Normalization[idx] <- "RPKG"
+  }
+}
+
+cat("Total viral predictions:", nrow(lifestyle_data), "\n")
+cat("Samples:", length(unique(lifestyle_data$Sample)), "\n")
+```
+
+## Load Viral ARG Data
+
+```{r load_viral_args}
+viral_arg_dir <- file.path(DATA_DIR, "04_Viruses/ARG")
+viral_arg_files <- list.files(viral_arg_dir, pattern = "_combined_hq_95-85\\.mapping_annotated\\.tsv$", full.names = TRUE)
+
+cat("Found", length(viral_arg_files), "Viral ARG files\n")
+
+viral_arg_list <- lapply(viral_arg_files, function(f) {
+  sample_name <- gsub("_combined_hq_95-85\\.mapping_annotated\\.tsv$", "", basename(f))
+  df <- tryCatch(fread(f), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) {
+    return(NULL)
+  }
+
+  # RPKG Calculation
+  ge_info <- get_genome_equivalents(sample_name, ge_df)
+
+  # Parse Coverage from read_id (SPAdes format: cov_X)
+  # Example: NODE_159_length_56990_cov_28.910863
+  df$coverage <- as.numeric(stringr::str_extract(df$read_id, "(?<=cov_)[0-9.]+"))
+
+  if (!is.null(ge_info) && !all(is.na(df$coverage))) {
+    # RPKG formula: (Coverage * 1000) / (ReadLength * GE)
+    # Impute missing coverage with 1 for safety
+    cov_vals <- df$coverage
+    cov_vals[is.na(cov_vals)] <- 1
+    df$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    df$Normalization <- "RPKG"
+  } else {
+    # Fallback
+    df$RPKG <- 1
+    df$Normalization <- "Raw/Proportional"
+    if (is.null(ge_info)) warning(paste("Missing GE for", sample_name, "- Using Raw Counts"))
+  }
+
+  df$Sample <- sample_name
+  return(df)
+})
+
+viral_arg_data <- rbindlist(viral_arg_list, fill = TRUE)
+cat("Total viral ARGs:", nrow(viral_arg_data), "\n")
+if (nrow(viral_arg_data) > 0) cat("Normalization Method used:", unique(viral_arg_data$Normalization), "\n")
+```
+
+## Viral Lifestyle Summary
+
+```{r lifestyle_summary}
+# Count per sample
+lifestyle_counts <- lifestyle_data %>%
+  group_by(Sample, Lifestyle) %>%
+  summarise(n = n(), Abundance = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(
+    total = sum(n),
+    fraction = n / total,
+    total_abundance = sum(Abundance),
+    fraction_abundance = Abundance / total_abundance
+  ) %>%
+  ungroup() %>%
+  left_join(metadata, by = c("Sample" = "SampleID"))
+
+# Sample ordering by Group4
+sample_order <- metadata %>%
+  arrange(Group4) %>%
+  pull(SampleID)
+lifestyle_counts$Sample <- factor(lifestyle_counts$Sample, levels = sample_order)
+
+knitr::kable(
+  lifestyle_counts %>%
+    dplyr::select(Sample, Lifestyle, n, fraction, Group4) %>%
+    arrange(Group4, Sample) %>%
+    head(30),
+  caption = "Viral Lifestyle Summary",
+  digits = 3
+)
+```
+
+## Stacked Barplot: Lifestyle by Sample
+
+```{r lifestyle_barplot}
+p_lifestyle_bar <- ggplot(lifestyle_counts, aes(x = Sample, y = n, fill = Lifestyle)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Phage Lifestyle Composition per Sample", y = "Fraction", x = "")
+
+print(p_lifestyle_bar)
+ggsave(file.path(OUT_DIR, "viral_lifestyle_barplot.pdf"), p_lifestyle_bar, width = 10, height = 6)
+
+# Stacked Barplot: Lifestyle by Sample (Abundance RPKG)
+p_lifestyle_rpkg <- ggplot(lifestyle_counts, aes(x = Sample, y = Abundance, fill = Lifestyle)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Phage Lifestyle Abundance per Sample", y = "Abundance (RPKG)", x = "")
+
+print(p_lifestyle_rpkg)
+ggsave(file.path(OUT_DIR, "viral_lifestyle_barplot_rpkg.pdf"), p_lifestyle_rpkg, width = 10, height = 6)
+
+# Grouped Summary Plot: Lifestyle Abundance (Mean + SE) by Group4
+library(multcompView)
+
+# Generic Function to get CLD letters
+get_cld_letters_generic <- function(data, value_col, group_col = "Group4", context_name = "Unknown") {
+  # Ensure column names are accessible
+  vals <- data[[value_col]]
+  grps <- data[[group_col]]
+
+  # Helper to format return
+  format_ret <- function(g, l) {
+    d <- data.frame(g, l, stringsAsFactors = FALSE)
+    colnames(d) <- c(group_col, "Letter")
+    return(d)
+  }
+
+  if (length(unique(grps)) < 2) {
+    return(format_ret(unique(grps), ""))
+  }
+
+  # Kruskal-Wallis
+  kw <- kruskal.test(vals ~ grps)
+
+  if (is.na(kw$p.value) || kw$p.value > 0.05) {
+    return(format_ret(unique(grps), "a"))
+  }
+
+  # Pairwise Wilcoxon
+  tryCatch(
+    {
+      pair_res <- pairwise.wilcox.test(vals, grps, p.adjust.method = "fdr")
+      p_matrix <- pair_res$p.value
+
+      p_vec <- c()
+      nms <- c()
+      if (!is.null(p_matrix)) {
+        cols <- colnames(p_matrix)
+        rows <- rownames(p_matrix)
+        for (j in 1:length(cols)) {
+          for (i in 1:length(rows)) {
+            if (!is.na(p_matrix[i, j])) {
+              p_vec <- c(p_vec, p_matrix[i, j])
+              nms <- c(nms, paste(rows[i], cols[j], sep = "-"))
+            }
+          }
+        }
+        names(p_vec) <- nms
+        letters <- multcompLetters(p_vec)$Letters
+        return(format_ret(names(letters), letters))
+      }
+      return(format_ret(unique(grps), "a"))
+    },
+    error = function(e) {
+      return(format_ret(unique(grps), ""))
+    }
+  )
+}
+
+# Helper to complete data with zeros for missing samples
+complete_with_zeros <- function(data, category_col, value_col, all_samples = unique(metadata$SampleID)) {
+  # Ensure all samples and categories are present
+  # We assume 'Sample' is the column name for samples in 'data'
+
+  # Get unique categories present in the data
+  cats <- unique(data[[category_col]])
+
+  # Create a full grid
+  full_grid <- expand.grid(Sample = all_samples, Category = cats, stringsAsFactors = FALSE)
+  colnames(full_grid)[2] <- category_col
+
+  # Join with data
+  data_full <- full_grid %>%
+    left_join(data, by = c("Sample", category_col))
+
+  # Fill NA values in value_col with 0
+  data_full[[value_col]][is.na(data_full[[value_col]])] <- 0
+
+  # Re-join metadata for grouping if needed (assuming Group4 was in data but lost in grid or NA in join)
+  # Actually, safer to drop metadata cols from data first, then rejoin fresh metadata
+  cols_to_keep <- c("Sample", category_col, value_col)
+  data_clean <- data_full[, cols_to_keep, drop = FALSE]
+
+  data_final <- data_clean %>%
+    left_join(metadata, by = c("Sample" = "SampleID"))
+
+  return(data_final)
+}
+
+lifestyle_summary_group <- lifestyle_counts %>%
+  group_by(Group4, Lifestyle) %>%
+  summarise(
+    Mean = mean(Abundance, na.rm = TRUE),
+    SD = sd(Abundance, na.rm = TRUE),
+    n = n(),
+    SE = SD / sqrt(n),
+    .groups = "drop"
+  )
+
+# Calculate CLD for Lifestyle
+# Zero-fill to ensure correct stats
+lifestyle_counts_filled <- complete_with_zeros(lifestyle_counts, "Lifestyle", "Abundance")
+
+cld_res_life <- list()
+for (sty in unique(lifestyle_counts_filled$Lifestyle)) {
+  sub <- lifestyle_counts_filled %>% filter(Lifestyle == sty)
+  res <- get_cld_letters_generic(sub, "Abundance", "Group4")
+  res$Lifestyle <- sty
+  cld_res_life[[sty]] <- res
+}
+cld_life_df <- bind_rows(cld_res_life)
+
+lifestyle_summary_group <- lifestyle_summary_group %>%
+  left_join(cld_life_df, by = c("Group4", "Lifestyle")) %>%
+  mutate(Letter = ifelse(is.na(Letter), "", Letter)) # Ensure no NA
+
+p_lifestyle_grouped_errorbar <- ggplot(lifestyle_summary_group, aes(x = Group4, y = Mean + 1, fill = Lifestyle)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9)) +
+  geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+    width = 0.2, position = position_dodge(0.9)
+  ) +
+  geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+    position = position_dodge(0.9), vjust = 0, size = 3
+  ) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  labs(title = "Mean Phage Lifestyle Abundance by Management Group", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+print(p_lifestyle_grouped_errorbar)
+ggsave(file.path(OUT_DIR, "viral_lifestyle_grouped_errorbar.pdf"), p_lifestyle_grouped_errorbar, width = 8, height = 6)
+```
+
+## Temperate Fraction by Group4
+
+```{r lifestyle_temperate}
+temperate_frac <- lifestyle_counts %>% filter(Lifestyle == "Temperate")
+
+if (nrow(temperate_frac) > 0) {
+  p_temperate <- ggplot(temperate_frac, aes(x = Group4, y = fraction, fill = Group4)) +
+    geom_boxplot(alpha = 0.7) +
+    geom_jitter(width = 0.2, alpha = 0.8, size = 3) +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 14) +
+    labs(title = "Proportion of Temperate Phages by Management Group", y = "Fraction Temperate", x = "") +
+    ylim(0, 1) +
+    theme(legend.position = "none")
+
+  print(p_temperate)
+  ggsave(file.path(OUT_DIR, "viral_lifestyle_temperate.pdf"), p_temperate, width = 6, height = 5)
+
+  # Kruskal-Wallis
+  if (length(unique(temperate_frac$Group4)) > 1) {
+    kw_res <- kruskal.test(fraction ~ Group4, data = temperate_frac)
+    cat("\nKruskal-Wallis: Temperate Fraction ~ Group4\n")
+    cat("Chi-squared:", round(kw_res$statistic, 4), ", p-value:", round(kw_res$p.value, 4), "\n")
+  }
+
+  # --- Abundance (RPKG) Plot ---
+  p_temperate_rpkg <- ggplot(temperate_frac, aes(x = Group4, y = Abundance, fill = Group4)) +
+    geom_boxplot(alpha = 0.7) +
+    geom_jitter(width = 0.2, alpha = 0.8, size = 3) +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 14) +
+    labs(title = "Temperate Phage Abundance by Management Group", y = "Abundance (RPKG)", x = "") +
+    theme(legend.position = "none")
+
+  print(p_temperate_rpkg)
+  ggsave(file.path(OUT_DIR, "viral_lifestyle_temperate_rpkg.pdf"), p_temperate_rpkg, width = 6, height = 5)
+}
+```
+
+## ARG on Temperate vs Virulent Phages
+
+```{r arg_on_lifestyle}
+if (nrow(viral_arg_data) > 0) {
+  # Join viral ARGs with lifestyle data
+  viral_arg_data <- viral_arg_data %>%
+    mutate(VirusID = read_id) # Virus contig ID
+
+  viral_arg_lifestyle <- viral_arg_data %>%
+    left_join(lifestyle_data %>% dplyr::select(VirusID, Lifestyle, Sample) %>% distinct(),
+      by = c("VirusID", "Sample")
+    )
+
+  # Count ARGs per lifestyle per sample
+  arg_lifestyle_counts <- viral_arg_lifestyle %>%
+    filter(!is.na(Lifestyle)) %>%
+    group_by(Sample, Lifestyle) %>%
+    summarise(n_ARGs = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+    group_by(Sample) %>%
+    mutate(total_ARGs = sum(n_ARGs), fraction = n_ARGs / total_ARGs) %>%
+    ungroup() %>%
+    left_join(metadata, by = c("Sample" = "SampleID"))
+
+  if (nrow(arg_lifestyle_counts) > 0) {
+    arg_lifestyle_counts$Sample <- factor(arg_lifestyle_counts$Sample, levels = sample_order)
+
+    p_arg_lifestyle <- ggplot(arg_lifestyle_counts, aes(x = Sample, y = n_ARGs, fill = Lifestyle)) +
+      geom_bar(stat = "identity", position = "fill") +
+      scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB")) +
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Distribution of Viral ARGs across Phage Lifestyles", y = "Fraction of ARGs", x = "")
+
+    print(p_arg_lifestyle)
+    ggsave(file.path(OUT_DIR, "arg_on_lifestyle.pdf"), p_arg_lifestyle, width = 10, height = 6)
+
+    # Abundance Plot (RPKG)
+    p_arg_lifestyle_rpkg <- ggplot(arg_lifestyle_counts, aes(x = Sample, y = n_ARGs, fill = Lifestyle)) +
+      geom_bar(stat = "identity", position = "stack") +
+      scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB")) +
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Viral ARG Abundance by Phage Lifestyle", y = "Abundance (RPKG)", x = "")
+
+    print(p_arg_lifestyle_rpkg)
+    ggsave(file.path(OUT_DIR, "arg_on_lifestyle_rpkg.pdf"), p_arg_lifestyle_rpkg, width = 10, height = 6)
+
+    # Grouped Summary Plot: Viral ARG Abundance (Mean + SE) by Group4
+    arg_lifestyle_summary_group <- arg_lifestyle_counts %>%
+      group_by(Group4, Lifestyle) %>%
+      summarise(
+        Mean = mean(n_ARGs, na.rm = TRUE),
+        SD = sd(n_ARGs, na.rm = TRUE),
+        n = n(),
+        SE = SD / sqrt(n),
+        .groups = "drop"
+      )
+
+    # Calculate CLD
+    # Zero-fill
+    arg_lifestyle_filled <- complete_with_zeros(arg_lifestyle_counts, "Lifestyle", "n_ARGs")
+
+    cld_res_varg <- list()
+    for (sty in unique(arg_lifestyle_filled$Lifestyle)) {
+      sub <- arg_lifestyle_filled %>% filter(Lifestyle == sty)
+      res <- get_cld_letters_generic(sub, "n_ARGs", "Group4")
+      res$Lifestyle <- sty
+      cld_res_varg[[sty]] <- res
+    }
+    cld_varg_df <- bind_rows(cld_res_varg)
+
+    arg_lifestyle_summary_group <- arg_lifestyle_summary_group %>%
+      left_join(cld_varg_df, by = c("Group4", "Lifestyle")) %>%
+      mutate(Letter = ifelse(is.na(Letter), "", Letter))
+
+    p_arg_lifestyle_grouped_errorbar <- ggplot(arg_lifestyle_summary_group, aes(x = Group4, y = Mean + 1, fill = Lifestyle)) +
+      geom_bar(stat = "identity", position = position_dodge(0.9)) +
+      geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+        width = 0.2, position = position_dodge(0.9)
+      ) +
+      geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+        position = position_dodge(0.9), vjust = 0, size = 3
+      ) +
+      scale_y_log10() +
+      scale_fill_manual(values = c("Temperate" = "#66C2A5", "Virulent" = "#FC8D62", "Uncertain" = "#8DA0CB")) +
+      theme_bw(base_size = 12) +
+      labs(title = "Mean Viral ARG Abundance on Phages by Management Group", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+    print(p_arg_lifestyle_grouped_errorbar)
+    ggsave(file.path(OUT_DIR, "arg_on_lifestyle_grouped_errorbar.pdf"), p_arg_lifestyle_grouped_errorbar, width = 8, height = 6)
+
+    # Temperate ARG fraction by Group4
+    arg_temperate <- arg_lifestyle_counts %>% filter(Lifestyle == "Temperate")
+    if (nrow(arg_temperate) > 2) {
+      p_arg_temp_group <- ggplot(arg_temperate, aes(x = Group4, y = fraction, fill = Group4)) +
+        geom_boxplot(alpha = 0.7) +
+        geom_jitter(width = 0.2, size = 3) +
+        scale_fill_manual(values = group4_colors) +
+        theme_bw(base_size = 14) +
+        labs(title = "Proportion of Viral ARGs Carried by Temperate Phages", y = "Fraction", x = "") +
+        theme(legend.position = "none")
+
+      print(p_arg_temp_group)
+      ggsave(file.path(OUT_DIR, "arg_on_temperate_by_group.pdf"), p_arg_temp_group, width = 6, height = 5)
+
+      # --- Abundance (RPKG) Plot ---
+      p_arg_temp_group_rpkg <- ggplot(arg_temperate, aes(x = Group4, y = n_ARGs, fill = Group4)) +
+        geom_boxplot(alpha = 0.7) +
+        geom_jitter(width = 0.2, size = 3) +
+        scale_fill_manual(values = group4_colors) +
+        theme_bw(base_size = 14) +
+        labs(title = "ARG Abundance on Temperate Phages by Management Group", y = "Abundance (RPKG)", x = "") +
+        theme(legend.position = "none")
+
+      print(p_arg_temp_group_rpkg)
+      ggsave(file.path(OUT_DIR, "arg_on_temperate_by_group_rpkg.pdf"), p_arg_temp_group_rpkg, width = 6, height = 5)
+    }
+  }
+} else {
+  message("No viral ARG data available")
+}
+```
+
+---
+
+# Phase 3: Plasmid Mobility Analysis (Q5.2)
+
+## Load MOB-typer Results
+
+```{r load_mobtyper}
+mobtyper_dir <- file.path(DATA_DIR, "03_Plasmids/Host_range_mobility/mobtyper_results")
+mobtyper_files <- list.files(mobtyper_dir, pattern = "_mobtyper\\.tsv$", full.names = TRUE)
+
+cat("Found", length(mobtyper_files), "MOB-typer files\n")
+
+mobtyper_list <- lapply(mobtyper_files, function(f) {
+  sample_name <- gsub("_mobtyper\\.tsv$", "", basename(f))
+  df <- tryCatch(fread(f), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) {
+    return(NULL)
+  }
+  df$Sample <- sample_name
+  return(df)
+})
+
+mobtyper_data <- rbindlist(mobtyper_list, fill = TRUE)
+
+# Standardize mobility classes
+mobtyper_data <- mobtyper_data %>%
+  mutate(
+    Mobility = case_when(
+      grepl("conjugative", predicted_mobility, ignore.case = TRUE) ~ "Conjugative",
+      grepl("mobilizable", predicted_mobility, ignore.case = TRUE) ~ "Mobilizable",
+      grepl("non-mobilizable", predicted_mobility, ignore.case = TRUE) ~ "Non-mobilizable",
+      TRUE ~ "Unknown"
+    ),
+    PlasmidID = stringr::str_extract(sample_id, "NODE_\\d+_length_\\d+_cov_[0-9.]+") # Extract standard SPAdes ID
+  )
+
+# Calculate RPKG for Plasmids (if coverage available)
+# Use existing get_genome_equivalents function
+mobtyper_data$coverage <- as.numeric(stringr::str_extract(mobtyper_data$PlasmidID, "(?<=cov_)[0-9.]+"))
+
+# Iterate to add RPKG (vectorized where possible, but GE is per sample)
+# To avoid slow loop, join with GE info? Or just Iterate unique samples.
+# Simple loop for robustness with existing structure:
+mobtyper_data$RPKG <- 1 # Default
+mobtyper_data$Normalization <- "Count"
+
+unique_samples <- unique(mobtyper_data$Sample)
+for (s in unique_samples) {
+  ge_info <- get_genome_equivalents(s, ge_df)
+  if (!is.null(ge_info)) {
+    idx <- mobtyper_data$Sample == s
+    cov_vals <- mobtyper_data$coverage[idx]
+    cov_vals[is.na(cov_vals)] <- 1
+
+    # RPKG = (Cov * 1000) / (RL * GE)
+    # Note: For CONTIG abundance, we usually use length too?
+    # RPKG for a gene is reads per kb per genome.
+    # For a contig, it's (Reads mapped) / (Length/1000) / GenomeEquivalents
+    # Reads mapped ~ Coverage * Length / ReadLength
+    # So (Cov * Length / RL) / (Length/1000) / GE
+    # = (Cov * 1000) / (RL * GE)
+    # Yes, length cancels out! Coverage is length-normalized already.
+
+    rpkg_vals <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    mobtyper_data$RPKG[idx] <- rpkg_vals
+    mobtyper_data$Normalization[idx] <- "RPKG"
+  }
+}
+
+cat("Total plasmid predictions:", nrow(mobtyper_data), "\n")
+```
+
+## Load Plasmid ARG Data
+
+```{r load_plasmid_args}
+plasmid_arg_dir <- file.path(DATA_DIR, "03_Plasmids/ARG")
+plasmid_arg_files <- list.files(plasmid_arg_dir, pattern = "_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", full.names = TRUE)
+
+cat("Found", length(plasmid_arg_files), "Plasmid ARG files\n")
+
+plasmid_arg_list <- lapply(plasmid_arg_files, function(f) {
+  sample_name <- gsub("_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", "", basename(f))
+  df <- tryCatch(fread(f), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) {
+    return(NULL)
+  }
+
+  # Clean read_id to match MOB-typer (SPAdes format)
+  # Remove suffixes like |linear|viralverify...
+  df$read_id <- stringr::str_extract(df$read_id, "NODE_\\d+_length_\\d+_cov_[0-9.]+")
+
+  # RPKG Calculation
+  ge_info <- get_genome_equivalents(sample_name, ge_df)
+
+  # Parse Coverage from read_id (SPAdes format: cov_X)
+  # Example: NODE_51_length_171379_cov_37.186109
+  df$coverage <- as.numeric(stringr::str_extract(df$read_id, "(?<=cov_)[0-9.]+"))
+
+  if (!is.null(ge_info) && !all(is.na(df$coverage))) {
+    # RPKG formula: (Coverage * 1000) / (ReadLength * GE)
+    cov_vals <- df$coverage
+    cov_vals[is.na(cov_vals)] <- 1
+    df$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    df$Normalization <- "RPKG"
+  } else {
+    # Fallback
+    df$RPKG <- 1
+    df$Normalization <- "Raw/Proportional"
+    if (is.null(ge_info)) warning(paste("Missing GE for", sample_name, "- Using Raw Counts"))
+  }
+
+  df$Sample <- sample_name
+  return(df)
+})
+
+plasmid_arg_data <- rbindlist(plasmid_arg_list, fill = TRUE)
+cat("Total plasmid ARGs:", nrow(plasmid_arg_data), "\n")
+if (nrow(plasmid_arg_data) > 0) cat("Normalization Method used:", unique(plasmid_arg_data$Normalization), "\n")
+```
+
+## Plasmid Mobility Summary
+
+```{r mobility_summary}
+mobility_counts <- mobtyper_data %>%
+  group_by(Sample, Mobility) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(total = sum(n), fraction = n / total) %>%
+  ungroup() %>%
+  left_join(metadata, by = c("Sample" = "SampleID"))
+
+mobility_counts$Sample <- factor(mobility_counts$Sample, levels = sample_order)
+
+knitr::kable(
+  mobility_counts %>%
+    dplyr::select(Sample, Mobility, n, fraction, Group4) %>%
+    arrange(Group4, Sample) %>%
+    head(30),
+  caption = "Plasmid Mobility Summary",
+  digits = 3
+)
+```
+
+## Stacked Barplot: Mobility by Sample
+
+```{r mobility_barplot}
+p_mobility_bar <- ggplot(mobility_counts, aes(x = Sample, y = n, fill = Mobility)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Plasmid Mobility Composition per Sample", y = "Fraction", x = "")
+
+print(p_mobility_bar)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_barplot.pdf"), p_mobility_bar, width = 10, height = 6)
+
+# Stacked Barplot: Mobility by Sample (RPKG Abundance)
+# Aggregate RPKG
+mobility_abundance <- mobtyper_data %>%
+  group_by(Sample, Mobility) %>%
+  summarise(Abundance = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  left_join(metadata, by = c("Sample" = "SampleID"))
+
+mobility_abundance$Sample <- factor(mobility_abundance$Sample, levels = sample_order)
+
+p_mobility_rpkg <- ggplot(mobility_abundance, aes(x = Sample, y = Abundance, fill = Mobility)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Plasmid Mobility Abundance per Sample", y = "Abundance (RPKG)", x = "")
+
+print(p_mobility_rpkg)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_barplot_rpkg.pdf"), p_mobility_rpkg, width = 10, height = 6)
+
+# Grouped Summary Plot: Plasmid Mobility Abundance (Mean + SE) by Group4
+mobility_summary_group <- mobility_abundance %>%
+  group_by(Group4, Mobility) %>%
+  summarise(
+    Mean = mean(Abundance, na.rm = TRUE),
+    SD = sd(Abundance, na.rm = TRUE),
+    n = n(),
+    SE = SD / sqrt(n),
+    .groups = "drop"
+  )
+
+# Calculate CLD
+# Zero-fill
+mobility_filled <- complete_with_zeros(mobility_abundance, "Mobility", "Abundance")
+
+cld_res_mob <- list()
+for (mob in unique(mobility_filled$Mobility)) {
+  sub <- mobility_filled %>% filter(Mobility == mob)
+  res <- get_cld_letters_generic(sub, "Abundance", "Group4")
+  res$Mobility <- mob
+  cld_res_mob[[mob]] <- res
+}
+cld_mob_df <- bind_rows(cld_res_mob)
+
+mobility_summary_group <- mobility_summary_group %>%
+  left_join(cld_mob_df, by = c("Group4", "Mobility")) %>%
+  mutate(Letter = ifelse(is.na(Letter), "", Letter))
+
+p_mobility_grouped_errorbar <- ggplot(mobility_summary_group, aes(x = Group4, y = Mean + 1, fill = Mobility)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9)) +
+  geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+    width = 0.2, position = position_dodge(0.9)
+  ) +
+  geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+    position = position_dodge(0.9), vjust = 0, size = 3
+  ) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+  theme_bw(base_size = 12) +
+  labs(title = "Mean Plasmid Mobility Abundance by Management Group", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+print(p_mobility_grouped_errorbar)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_grouped_errorbar.pdf"), p_mobility_grouped_errorbar, width = 8, height = 6)
+
+# Stacked Barplot: Mobility by Sample (ARG+ vs ARG- differentiated)
+# Annotate ARG Status
+mobtyper_data$Has_ARG <- mobtyper_data$PlasmidID %in% plasmid_arg_data$read_id
+
+mobtyper_data <- mobtyper_data %>%
+  mutate(
+    Mobility_Status = case_when(
+      Mobility == "Conjugative" & Has_ARG ~ "Conjugative (ARG+)",
+      Mobility == "Conjugative" & !Has_ARG ~ "Conjugative (ARG-)",
+      Mobility == "Mobilizable" & Has_ARG ~ "Mobilizable (ARG+)",
+      Mobility == "Mobilizable" & !Has_ARG ~ "Mobilizable (ARG-)",
+      Mobility == "Non-mobilizable" & Has_ARG ~ "Non-mobilizable (ARG+)",
+      Mobility == "Non-mobilizable" & !Has_ARG ~ "Non-mobilizable (ARG-)",
+      Mobility == "Unknown" & Has_ARG ~ "Unknown (ARG+)",
+      Mobility == "Unknown" & !Has_ARG ~ "Unknown (ARG-)"
+    )
+  )
+
+# Define Colors (Dark = ARG+, Light = ARG-)
+mob_arg_colors <- c(
+  "Conjugative (ARG+)" = "#E41A1C", # Dark Red
+  "Conjugative (ARG-)" = "#FB9A99", # Light Red
+  "Mobilizable (ARG+)" = "#1F78B4", # Dark Blue
+  "Mobilizable (ARG-)" = "#A6CEE3", # Light Blue
+  "Non-mobilizable (ARG+)" = "#33A02C", # Dark Green
+  "Non-mobilizable (ARG-)" = "#B2DF8A", # Light Green
+  "Unknown (ARG+)" = "#666666", # Dark Grey
+  "Unknown (ARG-)" = "#D9D9D9" # Light Grey
+)
+
+# Aggregate RPKG by new Status
+mobility_arg_abundance <- mobtyper_data %>%
+  group_by(Sample, Mobility_Status) %>%
+  summarise(Abundance = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  left_join(metadata, by = c("Sample" = "SampleID"))
+
+mobility_arg_abundance$Sample <- factor(mobility_arg_abundance$Sample, levels = sample_order)
+# Ensure factor order for legend (Conjugative+, Conjugative-, etc.)
+status_levels <- c(
+  "Conjugative (ARG+)", "Conjugative (ARG-)",
+  "Mobilizable (ARG+)", "Mobilizable (ARG-)",
+  "Non-mobilizable (ARG+)", "Non-mobilizable (ARG-)",
+  "Unknown (ARG+)", "Unknown (ARG-)"
+)
+mobility_arg_abundance$Mobility_Status <- factor(mobility_arg_abundance$Mobility_Status, levels = status_levels)
+
+p_mobility_arg_status <- ggplot(mobility_arg_abundance, aes(x = Sample, y = Abundance, fill = Mobility_Status)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = mob_arg_colors) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Plasmid Mobility Abundance — ARG-Carrying vs. ARG-Free",
+    y = "Abundance (RPKG)", x = "", fill = "Plasmid Type"
+  )
+
+print(p_mobility_arg_status)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_arg_status_rpkg.pdf"), p_mobility_arg_status, width = 12, height = 7)
+
+# Grouped Summary Plot: Mobility Status (ARG+/-) Abundance (Mean + SE) by Group4
+mobility_arg_summary_group <- mobility_arg_abundance %>%
+  group_by(Group4, Mobility_Status) %>%
+  summarise(
+    Mean = mean(Abundance, na.rm = TRUE),
+    SD = sd(Abundance, na.rm = TRUE),
+    n = n(),
+    SE = SD / sqrt(n),
+    .groups = "drop"
+  )
+
+# Calculate CLD
+# Zero-fill
+mobility_arg_filled <- complete_with_zeros(mobility_arg_abundance, "Mobility_Status", "Abundance")
+
+cld_res_mob_stat <- list()
+for (stat in unique(mobility_arg_filled$Mobility_Status)) {
+  sub <- mobility_arg_filled %>% filter(Mobility_Status == stat)
+  res <- get_cld_letters_generic(sub, "Abundance", "Group4")
+  res$Mobility_Status <- stat
+  cld_res_mob_stat[[stat]] <- res
+}
+cld_mob_stat_df <- bind_rows(cld_res_mob_stat)
+
+mobility_arg_summary_group <- mobility_arg_summary_group %>%
+  left_join(cld_mob_stat_df, by = c("Group4", "Mobility_Status")) %>%
+  mutate(Letter = ifelse(is.na(Letter), "", Letter))
+
+p_mobility_status_grouped_errorbar <- ggplot(mobility_arg_summary_group, aes(x = Group4, y = Mean + 1, fill = Mobility_Status)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9)) +
+  geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+    width = 0.2, position = position_dodge(0.9)
+  ) +
+  geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+    position = position_dodge(0.9), vjust = 0, size = 3
+  ) +
+  scale_y_log10() +
+  scale_fill_manual(values = mob_arg_colors) +
+  theme_bw(base_size = 12) +
+  labs(title = "Mean Plasmid Abundance by Mobility and ARG Status", y = "Mean Abundance (RPKG, log scale)", x = "", fill = "Plasmid Type")
+
+print(p_mobility_status_grouped_errorbar)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_arg_status_grouped_errorbar.pdf"), p_mobility_status_grouped_errorbar, width = 12, height = 7)
+```
+
+## Mobility Fractions by Group4
+
+```{r mobility_boxplots, fig.height=10}
+p_mobility_all <- ggplot(mobility_counts, aes(x = Group4, y = fraction, fill = Group4)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.8, size = 2) +
+  facet_wrap(~Mobility, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = group4_colors) +
+  theme_bw(base_size = 12) +
+  labs(title = "Plasmid Mobility Fractions by Management Group", y = "Fraction", x = "") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_mobility_all)
+ggsave(file.path(OUT_DIR, "plasmid_mobility_by_group.pdf"), p_mobility_all, width = 10, height = 8)
+
+# --- Abundance (RPKG) Boxplots ---
+if (exists("mobility_abundance")) {
+  p_mobility_all_rpkg <- ggplot(mobility_abundance, aes(x = Group4, y = Abundance, fill = Group4)) +
+    geom_boxplot(alpha = 0.7) +
+    geom_jitter(width = 0.2, alpha = 0.8, size = 2) +
+    facet_wrap(~Mobility, scales = "free_y", ncol = 2) +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(title = "Plasmid Mobility Abundance by Management Group", y = "Abundance (RPKG)", x = "") +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p_mobility_all_rpkg)
+  ggsave(file.path(OUT_DIR, "plasmid_mobility_by_group_rpkg.pdf"), p_mobility_all_rpkg, width = 10, height = 8)
+}
+
+# Statistical tests
+cat("\n=== Kruskal-Wallis Tests: Mobility ~ Group4 ===\n")
+for (mob_class in unique(mobility_counts$Mobility)) {
+  mob_data <- mobility_counts %>% filter(Mobility == mob_class)
+  if (nrow(mob_data) >= 3 && length(unique(mob_data$Group4)) > 1) {
+    kw_res <- kruskal.test(fraction ~ Group4, data = mob_data)
+    cat(mob_class, ": Chi-sq =", round(kw_res$statistic, 3), ", p =", round(kw_res$p.value, 4), "\n")
+  }
+}
+```
+
+## ARG on Mobility Classes
+
+```{r arg_on_mobility}
+if (nrow(plasmid_arg_data) > 0) {
+  # Join plasmid ARGs with mobility data
+  plasmid_arg_data <- plasmid_arg_data %>%
+    mutate(PlasmidID = read_id) # Plasmid contig ID
+
+  plasmid_arg_mobility <- plasmid_arg_data %>%
+    left_join(mobtyper_data %>% dplyr::select(PlasmidID, Mobility, Sample) %>% distinct(),
+      by = c("PlasmidID", "Sample")
+    )
+
+  # Count ARGs per mobility class per sample
+  arg_mobility_counts <- plasmid_arg_mobility %>%
+    filter(!is.na(Mobility)) %>%
+    group_by(Sample, Mobility) %>%
+    summarise(n_ARGs = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+    group_by(Sample) %>%
+    mutate(total_ARGs = sum(n_ARGs), fraction = n_ARGs / total_ARGs) %>%
+    ungroup() %>%
+    left_join(metadata, by = c("Sample" = "SampleID"))
+
+  if (nrow(arg_mobility_counts) > 0) {
+    arg_mobility_counts$Sample <- factor(arg_mobility_counts$Sample, levels = sample_order)
+
+    p_arg_mobility <- ggplot(arg_mobility_counts, aes(x = Sample, y = n_ARGs, fill = Mobility)) +
+      geom_bar(stat = "identity", position = "fill") +
+      scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Distribution of Plasmid-Borne ARGs across Mobility Classes", y = "Fraction of ARGs", x = "")
+
+    print(p_arg_mobility)
+    ggsave(file.path(OUT_DIR, "arg_on_mobility_class.pdf"), p_arg_mobility, width = 10, height = 6)
+
+    # Abundance Plot (RPKG)
+    p_arg_mobility_rpkg <- ggplot(arg_mobility_counts, aes(x = Sample, y = n_ARGs, fill = Mobility)) +
+      geom_bar(stat = "identity", position = "stack") + # Stacked bars for absolute abundance
+      scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+      theme_bw(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Plasmid-Borne ARG Abundance by Mobility Class", y = "Abundance (RPKG)", x = "")
+
+    print(p_arg_mobility_rpkg)
+    ggsave(file.path(OUT_DIR, "arg_on_mobility_class_rpkg.pdf"), p_arg_mobility_rpkg, width = 10, height = 6)
+
+    # Grouped Summary Plot: Plasmid ARG Abundance per Mobility Class (Mean + SE) by Group4
+    # Grouped Summary Plot: Plasmid ARG Abundance per Mobility Class (Mean + SE) by Group4
+    arg_mobility_summary_group <- arg_mobility_counts %>%
+      group_by(Group4, Mobility) %>%
+      summarise(
+        Mean = mean(n_ARGs, na.rm = TRUE),
+        SD = sd(n_ARGs, na.rm = TRUE),
+        n = n(),
+        SE = SD / sqrt(n),
+        .groups = "drop"
+      )
+
+    # --- Statistical Letters (CLD) ---
+    library(multcompView)
+
+    # Helper to get letters for a subset
+    get_cld_letters <- function(data) {
+      if (length(unique(data$Group4)) < 2) {
+        return(data.frame(Group4 = unique(data$Group4), Letter = ""))
+      }
+
+      # Kruskal-Wallis first
+      kw <- kruskal.test(n_ARGs ~ Group4, data = data)
+      if (is.na(kw$p.value) || kw$p.value > 0.05) {
+        return(data.frame(Group4 = unique(data$Group4), Letter = "a"))
+      }
+
+      # Pairwise Wilcoxon
+      tryCatch(
+        {
+          pair_res <- pairwise.wilcox.test(data$n_ARGs, data$Group4, p.adjust.method = "fdr")
+          p_matrix <- pair_res$p.value
+
+          p_vec <- c()
+          nms <- c()
+          if (!is.null(p_matrix)) {
+            cols <- colnames(p_matrix)
+            rows <- rownames(p_matrix)
+            for (j in 1:length(cols)) {
+              for (i in 1:length(rows)) {
+                if (!is.na(p_matrix[i, j])) {
+                  p_vec <- c(p_vec, p_matrix[i, j])
+                  nms <- c(nms, paste(rows[i], cols[j], sep = "-"))
+                }
+              }
+            }
+            names(p_vec) <- nms
+            letters <- multcompLetters(p_vec)$Letters
+            return(data.frame(Group4 = names(letters), Letter = letters))
+          }
+          return(data.frame(Group4 = unique(data$Group4), Letter = "a"))
+        },
+        error = function(e) {
+          return(data.frame(Group4 = unique(data$Group4), Letter = ""))
+        }
+      )
+    }
+
+    # Apply to each Mobility Class
+    cld_results <- list()
+    for (mob in unique(arg_mobility_counts$Mobility)) {
+      sub_data <- arg_mobility_counts %>% filter(Mobility == mob)
+      res <- get_cld_letters(sub_data)
+      res$Mobility <- mob
+      cld_results[[mob]] <- res
+    }
+    cld_df <- bind_rows(cld_results)
+
+    # Check checking for duplicates
+    arg_mobility_summary_group <- arg_mobility_summary_group %>%
+      left_join(cld_df, by = c("Group4", "Mobility")) %>%
+      mutate(Letter = ifelse(is.na(Letter), "", Letter))
+
+    p_arg_mobility_grouped_errorbar <- ggplot(arg_mobility_summary_group, aes(x = Group4, y = Mean + 1, fill = Mobility)) +
+      geom_bar(stat = "identity", position = position_dodge(0.9)) +
+      geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+        width = 0.2, position = position_dodge(0.9)
+      ) +
+      geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+        position = position_dodge(0.9), vjust = 0, size = 3
+      ) +
+      scale_y_log10() +
+      scale_fill_manual(values = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8", "Non-mobilizable" = "#4DAF4A", "Unknown" = "grey70")) +
+      theme_bw(base_size = 12) +
+      labs(title = "Mean Plasmid-Borne ARG Abundance by Mobility Class", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+    print(p_arg_mobility_grouped_errorbar)
+    ggsave(file.path(OUT_DIR, "arg_on_mobility_grouped_errorbar.pdf"), p_arg_mobility_grouped_errorbar, width = 10, height = 6)
+
+    # Conjugative ARG fraction by Group4
+    arg_conj <- arg_mobility_counts %>% filter(Mobility == "Conjugative")
+    if (nrow(arg_conj) > 2) {
+      p_arg_conj_group <- ggplot(arg_conj, aes(x = Group4, y = fraction, fill = Group4)) +
+        geom_boxplot(alpha = 0.7) +
+        geom_jitter(width = 0.2, size = 3) +
+        scale_fill_manual(values = group4_colors) +
+        theme_bw(base_size = 14) +
+        labs(title = "Proportion of ARGs on Conjugative Plasmids", y = "Fraction", x = "") +
+        theme(legend.position = "none")
+
+      print(p_arg_conj_group)
+      ggsave(file.path(OUT_DIR, "arg_on_conjugative_by_group.pdf"), p_arg_conj_group, width = 6, height = 5)
+    }
+
+    # All mobility classes by Group4
+    p_arg_mob_group <- ggplot(arg_mobility_counts, aes(x = Group4, y = fraction, fill = Group4)) +
+      geom_boxplot(alpha = 0.7) +
+      geom_jitter(width = 0.2, size = 2) +
+      facet_wrap(~Mobility, ncol = 3) +
+      scale_fill_manual(values = group4_colors) +
+      theme_bw(base_size = 12) +
+      labs(title = "ARG Fraction per Mobility Class by Management Group", y = "Fraction", x = "") +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    print(p_arg_mob_group)
+    ggsave(file.path(OUT_DIR, "arg_on_mobility_by_group.pdf"), p_arg_mob_group, width = 10, height = 5)
+
+    # --- Abundance (RPKG) Boxplots ---
+    # 1. Conjugative only
+    p_arg_conj_group_rpkg <- ggplot(arg_conj, aes(x = Group4, y = n_ARGs, fill = Group4)) +
+      geom_boxplot(alpha = 0.7) +
+      geom_jitter(width = 0.2, size = 3) +
+      scale_fill_manual(values = group4_colors) +
+      theme_bw(base_size = 14) +
+      labs(title = "ARG Abundance on Conjugative Plasmids by Management Group", y = "Abundance (RPKG)", x = "") +
+      theme(legend.position = "none")
+
+    print(p_arg_conj_group_rpkg)
+    ggsave(file.path(OUT_DIR, "arg_on_conjugative_by_group_rpkg.pdf"), p_arg_conj_group_rpkg, width = 6, height = 5)
+
+    # 2. All Classes
+    p_arg_mob_group_rpkg <- ggplot(arg_mobility_counts, aes(x = Group4, y = n_ARGs, fill = Group4)) +
+      geom_boxplot(alpha = 0.7) +
+      geom_jitter(width = 0.2, size = 2) +
+      facet_wrap(~Mobility, ncol = 3, scales = "free_y") +
+      scale_fill_manual(values = group4_colors) +
+      theme_bw(base_size = 12) +
+      labs(title = "ARG Abundance per Mobility Class by Management Group", y = "Abundance (RPKG)", x = "") +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    print(p_arg_mob_group_rpkg)
+    ggsave(file.path(OUT_DIR, "arg_on_mobility_by_group_rpkg.pdf"), p_arg_mob_group_rpkg, width = 10, height = 5)
+  }
+} else {
+  message("No plasmid ARG data available")
+}
+```
+
+## Detailed Heatmap: Mobile Plasmids and Their ARGs
+
+```{r heatmap_detailed_mobile}
+if (requireNamespace("pheatmap", quietly = TRUE) &&
+  exists("mobtyper_data") && !is.null(mobtyper_data) &&
+  exists("plasmid_arg_data") && !is.null(plasmid_arg_data)) {
+  cat("\n=== Detailed Mobile Plasmid & ARG Heatmaps ===\n")
+
+  # 1. Filter for Mobile Plasmids (Conjugative & Mobilizable)
+  mobile_plasmids_df <- mobtyper_data %>%
+    filter(Mobility %in% c("Conjugative", "Mobilizable"))
+
+  if (nrow(mobile_plasmids_df) > 0) {
+    # --- Heatmap A: Mobile Plasmids Abundance (Top 40) ---
+    mat_mobile <- mobile_plasmids_df %>%
+      dplyr::select(PlasmidID, Sample, RPKG) %>%
+      group_by(PlasmidID, Sample) %>%
+      summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Sample, values_from = RPKG, values_fill = 0) %>%
+      column_to_rownames("PlasmidID")
+
+    # Filter Top N by mean abundance
+    top_n <- 40
+    if (nrow(mat_mobile) > top_n) {
+      keep_plasmids <- names(sort(rowMeans(mat_mobile), decreasing = TRUE)[1:top_n])
+      mat_mobile_top <- mat_mobile[keep_plasmids, , drop = FALSE]
+    } else {
+      mat_mobile_top <- mat_mobile
+      keep_plasmids <- rownames(mat_mobile)
+    }
+
+    # Annotations
+    annot_row <- mobile_plasmids_df %>%
+      filter(PlasmidID %in% keep_plasmids) %>%
+      dplyr::select(PlasmidID, Mobility) %>%
+      distinct() %>%
+      column_to_rownames("PlasmidID")
+
+    # Check if samples in mat_mobile_top are in metadata
+    valid_samples <- intersect(colnames(mat_mobile_top), rownames(metadata))
+    mat_mobile_top <- mat_mobile_top[, valid_samples, drop = FALSE]
+    annot_col <- metadata[valid_samples, "Group4", drop = FALSE]
+
+    # Colors
+    ann_colors <- list(
+      Mobility = c("Conjugative" = "#E41A1C", "Mobilizable" = "#377EB8"),
+      Group4 = group4_colors
+    )
+
+    if (ncol(mat_mobile_top) > 1 && nrow(mat_mobile_top) > 1) {
+      p1 <- pheatmap::pheatmap(log1p(mat_mobile_top),
+        cluster_rows = TRUE, cluster_cols = FALSE,
+        annotation_row = annot_row,
+        annotation_col = annot_col,
+        annotation_colors = ann_colors,
+        main = "Top Mobile Plasmids (Log1p RPKG)",
+        show_rownames = FALSE, fontsize = 9
+      )
+
+      # Save
+      pdf(file.path(OUT_DIR, "heatmap_detailed_mobile_plasmids.pdf"), width = 10, height = 8)
+      grid::grid.newpage()
+      grid::grid.draw(p1$gtable)
+      dev.off()
+      print(p1)
+    }
+
+    # --- Heatmap B: ARGs on Mobile Plasmids (Top 40) ---
+    mobile_ids <- mobile_plasmids_df$PlasmidID
+
+    mobile_args_df <- plasmid_arg_data %>%
+      filter(read_id %in% mobile_ids) %>%
+      left_join(mobile_plasmids_df %>% dplyr::select(PlasmidID, Mobility), by = c("read_id" = "PlasmidID"))
+
+    if (nrow(mobile_args_df) > 0) {
+      # Use best_hit or gene or resistance_mechanism
+      cols_try <- intersect(colnames(mobile_args_df), c("best_hit", "gene", "ARG", "resistance_mechanism"))
+      target_col <- if (length(cols_try) > 0) cols_try[1] else "resistance_mechanism"
+
+      arg_mat <- mobile_args_df %>%
+        dplyr::select(Sample, Feature = !!sym(target_col), RPKG) %>%
+        mutate(RPKG = as.numeric(RPKG)) %>%
+        filter(!is.na(Feature)) %>%
+        group_by(Sample, Feature) %>%
+        summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+        pivot_wider(names_from = Sample, values_from = RPKG, values_fill = 0) %>%
+        column_to_rownames("Feature")
+
+      # Filter Top N
+      if (nrow(arg_mat) > top_n) {
+        keep_args <- names(sort(rowMeans(arg_mat), decreasing = TRUE)[1:top_n])
+        arg_mat_top <- arg_mat[keep_args, , drop = FALSE]
+      } else {
+        arg_mat_top <- arg_mat
+      }
+
+      valid_samples_arg <- intersect(colnames(arg_mat_top), rownames(metadata))
+      arg_mat_top <- arg_mat_top[, valid_samples_arg, drop = FALSE]
+      annot_col_arg <- metadata[valid_samples_arg, "Group4", drop = FALSE]
+
+      if (ncol(arg_mat_top) > 1 && nrow(arg_mat_top) > 1) {
+        # Scale
+        p2 <- pheatmap::pheatmap(log1p(arg_mat_top),
+          cluster_rows = TRUE, cluster_cols = FALSE,
+          annotation_col = annot_col_arg,
+          annotation_colors = list(Group4 = group4_colors),
+          main = paste("Top ARGs on Mobile Plasmids (Log1p RPKG) -", target_col),
+          fontsize = 9
+        )
+
+        # Save
+        pdf(file.path(OUT_DIR, "heatmap_detailed_mobile_args.pdf"), width = 10, height = 8)
+        grid::grid.newpage()
+        grid::grid.draw(p2$gtable)
+        dev.off()
+        print(p2)
+      }
+    } else {
+      cat("No ARGs found on the identified mobile plasmids.\n")
+    }
+  } else {
+    cat("No Conjugative or Mobilizable plasmids identified.\n")
+  }
+}
+```
+
+---
+
+
+## Plasmid ARG Profiles (Class & Mechanism)
+
+```{r heatmap_plasmid_profiles}
+if (requireNamespace("pheatmap", quietly = TRUE) &&
+  exists("plasmid_arg_data") && !is.null(plasmid_arg_data) && nrow(plasmid_arg_data) > 0) {
+  cat("\n=== Plasmid Resistome Profiles (Class & Mechanism) ===\n")
+
+  # Function to generate heatmap for a specific grouping column
+  plot_plasmid_profile <- function(data, group_col, title_suffix, top_n = 25) {
+    # Check if column exists
+    target_col <- group_col
+    if (!target_col %in% colnames(data)) {
+      # Try alternative column names if standard ones fail
+      if (group_col == "predicted_ARG.class") {
+        alt <- intersect(colnames(data), c("predicted_ARG_class", "class", "Class"))
+        if (length(alt) > 0) target_col <- alt[1] else return(NULL)
+      } else {
+        return(NULL)
+      }
+    }
+
+    # Aggregate RPKG
+    mat <- data %>%
+      group_by(Sample, !!sym(target_col)) %>%
+      summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Sample, values_from = RPKG, values_fill = 0) %>%
+      column_to_rownames(target_col)
+
+    # Filter Top N
+    if (nrow(mat) > top_n) {
+      keep_feats <- names(sort(rowMeans(mat), decreasing = TRUE)[1:top_n])
+      mat_top <- mat[keep_feats, , drop = FALSE]
+    } else {
+      mat_top <- mat
+    }
+
+    # Metadata Annotation
+    valid_samples <- intersect(colnames(mat_top), rownames(metadata))
+    if (length(valid_samples) < 2) {
+      return(NULL)
+    }
+
+    mat_top <- mat_top[, valid_samples, drop = FALSE]
+    annot_col <- metadata[valid_samples, "Group4", drop = FALSE]
+
+    # Plot
+    p <- pheatmap::pheatmap(log1p(mat_top),
+      cluster_rows = TRUE, cluster_cols = FALSE,
+      annotation_col = annot_col,
+      annotation_colors = list(Group4 = group4_colors),
+      main = paste("Plasmid ARGs by", title_suffix, "(Log1p RPKG)"),
+      fontsize = 9
+    )
+
+    # Save
+    fname <- paste0("heatmap_plasmid_", tolower(gsub(" ", "_", title_suffix)), ".pdf")
+    pdf(file.path(OUT_DIR, fname), width = 10, height = 8)
+    grid::grid.newpage()
+    grid::grid.draw(p$gtable)
+    dev.off()
+    print(p)
+  }
+
+  # 1. ARG Class Heatmap
+  plot_plasmid_profile(plasmid_arg_data, "predicted_ARG.class", "Class")
+
+  # 2. ARG Mechanism Heatmap
+  plot_plasmid_profile(plasmid_arg_data, "resistance_mechanism", "Mechanism")
+} else {
+  cat("No Plasmid ARG data available for profiles.\n")
+}
+```
+
+---
+
+# Phase 4: ARG Genomic Context (Q5.1)
+
+## Load ARG Counts Per Domain
+
+```{r load_arg_context}
+# Count ARGs per domain per sample
+
+# Standard function for single-file-per-sample domains
+count_args <- function(dir_path, pattern, sample_extractor = NULL, ge_data = ge_df) {
+  files <- list.files(dir_path, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) {
+    return(data.frame(Sample = character(), n_ARGs = numeric()))
+  }
+
+  counts <- lapply(files, function(f) {
+    if (!is.null(sample_extractor)) {
+      sample_name <- sample_extractor(basename(f))
+    } else {
+      sample_name <- gsub(pattern, "", basename(f))
+      sample_name <- gsub("\\.$", "", sample_name)
+    }
+    df <- tryCatch(fread(f), error = function(e) NULL)
+
+    # RPKG Calculation (Standardized)
+    n_val <- 0
+    if (!is.null(df) && nrow(df) > 0) {
+      ge_info <- get_genome_equivalents(sample_name, ge_data)
+      # Try sparse coverage parsing
+      df$coverage <- as.numeric(stringr::str_extract(df$read_id, "(?<=cov_)[0-9.]+"))
+
+      if (!is.null(ge_info) && !all(is.na(df$coverage))) {
+        cov_vals <- df$coverage
+        cov_vals[is.na(cov_vals)] <- 1
+        rpkg <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+        n_val <- sum(rpkg, na.rm = TRUE)
+      } else {
+        # Fallback to counts if GE missing
+        n_val <- nrow(df)
+        if (is.null(ge_info)) warning(paste(sample_name, "- Missing GE, using counts"))
+      }
+    }
+    data.frame(Sample = sample_name, n_ARGs = n_val)
+  })
+
+  # Aggregate in case multiple files per sample (like MAGs)
+  bind_rows(counts) %>%
+    group_by(Sample) %>%
+    summarise(n_ARGs = sum(n_ARGs), .groups = "drop")
+}
+
+# Contigs: simple pattern
+arg_contigs <- count_args(file.path(DATA_DIR, "01_contigs/ARG"), "\\.mapping_annotated\\.tsv$", ge_data = ge_df)
+arg_contigs$Domain <- "Contigs"
+
+# MAGs: files are per-MAG
+mag_sample_extractor <- function(fn) {
+  gsub("_magscot_cleanbin_\\d+\\.mapping_annotated\\.tsv$", "", fn)
+}
+arg_mags <- count_args(file.path(DATA_DIR, "02_MAGs/ARG"), "\\.mapping_annotated\\.tsv$", mag_sample_extractor, ge_data = ge_df)
+arg_mags$Domain <- "MAGs"
+
+# Plasmids: combined per sample
+plasmid_sample_extractor <- function(fn) {
+  gsub("_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", "", fn)
+}
+arg_plasmids <- count_args(file.path(DATA_DIR, "03_Plasmids/ARG"), "_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", plasmid_sample_extractor, ge_data = ge_df)
+arg_plasmids$Domain <- "Plasmids"
+
+# Viruses: combined per sample
+virus_sample_extractor <- function(fn) {
+  gsub("_combined_hq_95-85\\.mapping_annotated\\.tsv$", "", fn)
+}
+arg_viruses <- count_args(file.path(DATA_DIR, "04_Viruses/ARG"), "_combined_hq_95-85\\.mapping_annotated\\.tsv$", virus_sample_extractor, ge_data = ge_df)
+arg_viruses$Domain <- "Viruses"
+
+arg_context <- bind_rows(arg_contigs, arg_mags, arg_plasmids, arg_viruses) %>%
+  left_join(metadata, by = c("Sample" = "SampleID"))
+
+cat("ARG counts per domain:\n")
+print(arg_context %>% group_by(Domain) %>% summarise(n_samples = n(), total_ARGs = sum(n_ARGs)))
+```
+
+## ARG Distribution Across Domains
+
+```{r arg_domain_dist}
+arg_fractions <- arg_context %>%
+  group_by(Sample) %>%
+  mutate(
+    RPKG = n_ARGs, # Explicit RPKG column (n_ARGs already contains RPKG values)
+    total_ARGs = sum(n_ARGs),
+    total_RPKG = sum(RPKG),
+    fraction = n_ARGs / total_ARGs
+  ) %>%
+  ungroup()
+
+arg_fractions$Sample <- factor(arg_fractions$Sample, levels = sample_order)
+arg_fractions$Domain <- factor(arg_fractions$Domain, levels = c("Contigs", "MAGs", "Plasmids", "Viruses"))
+
+p_arg_context <- ggplot(arg_fractions, aes(x = Sample, y = n_ARGs, fill = Domain)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Genomic Context of Antibiotic Resistance Genes", y = "Fraction of ARGs", x = "")
+
+print(p_arg_context)
+ggsave(file.path(OUT_DIR, "arg_genomic_context.pdf"), p_arg_context, width = 10, height = 6)
+
+# Stacked Barplot: ARG Context by Sample (Abundance RPKG)
+p_arg_context_rpkg <- ggplot(arg_fractions, aes(x = Sample, y = n_ARGs, fill = Domain)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "ARG Abundance across Genomic Compartments", y = "Abundance (RPKG)", x = "")
+
+print(p_arg_context_rpkg)
+ggsave(file.path(OUT_DIR, "arg_genomic_context_rpkg.pdf"), p_arg_context_rpkg, width = 10, height = 6)
+
+# Grouped Summary Plot: ARG Context Abundance (Mean + SE) by Group4
+arg_helper_join <- arg_fractions
+if (!"Group4" %in% colnames(arg_helper_join)) {
+  arg_helper_join <- arg_helper_join %>% left_join(metadata, by = c("Sample" = "SampleID"))
+}
+
+arg_context_summary_group <- arg_helper_join %>%
+  group_by(Group4, Domain) %>%
+  summarise(
+    Mean = mean(n_ARGs, na.rm = TRUE),
+    SD = sd(n_ARGs, na.rm = TRUE),
+    n = n(),
+    SE = SD / sqrt(n),
+    .groups = "drop"
+  )
+
+# Calculate CLD
+# Zero-fill
+arg_context_filled <- complete_with_zeros(arg_helper_join, "Domain", "n_ARGs")
+
+cld_res_ctx <- list()
+for (dom in unique(arg_context_filled$Domain)) {
+  sub <- arg_context_filled %>% filter(Domain == dom)
+  res <- get_cld_letters_generic(sub, "n_ARGs", "Group4")
+  res$Domain <- dom
+  cld_res_ctx[[dom]] <- res
+}
+cld_ctx_df <- bind_rows(cld_res_ctx)
+
+arg_context_summary_group <- arg_context_summary_group %>%
+  left_join(cld_ctx_df, by = c("Group4", "Domain")) %>%
+  mutate(Letter = ifelse(is.na(Letter), "", Letter)) # Ensure no NA
+
+
+p_arg_context_grouped_errorbar <- ggplot(arg_context_summary_group, aes(x = Group4, y = Mean + 1, fill = Domain)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9)) +
+  geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+    width = 0.2, position = position_dodge(0.9)
+  ) +
+  geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+    position = position_dodge(0.9), vjust = 0, size = 3
+  ) +
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw(base_size = 12) +
+  labs(title = "Mean ARG Abundance per Genomic Compartment by Management Group", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+print(p_arg_context_grouped_errorbar)
+ggsave(file.path(OUT_DIR, "arg_genomic_context_grouped_errorbar.pdf"), p_arg_context_grouped_errorbar, width = 10, height = 6)
+```
+
+## ARG Context by Group4
+
+```{r arg_context_group, fig.height=8}
+p_arg_context_group <- ggplot(arg_fractions, aes(x = Group4, y = fraction, fill = Group4)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.8, size = 2) +
+  facet_wrap(~Domain, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = group4_colors) +
+  theme_bw(base_size = 12) +
+  labs(title = "ARG Fraction per Genomic Compartment by Management Group", y = "Fraction", x = "") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_arg_context_group)
+ggsave(file.path(OUT_DIR, "arg_context_by_group.pdf"), p_arg_context_group, width = 10, height = 8)
+
+# Statistical tests
+cat("\n=== Kruskal-Wallis Tests: ARG Fraction ~ Group4 ===\n")
+for (dom in unique(arg_fractions$Domain)) {
+  dom_data <- arg_fractions %>% filter(Domain == dom)
+  if (nrow(dom_data) >= 3 && length(unique(dom_data$Group4)) > 1) {
+    kw_res <- kruskal.test(fraction ~ Group4, data = dom_data)
+    cat(dom, ": Chi-sq =", round(kw_res$statistic, 3), ", p =", round(kw_res$p.value, 4), "\n")
+  }
+}
+
+# --- Abundance (RPKG) Boxplots ---
+p_arg_context_group_rpkg <- ggplot(arg_fractions, aes(x = Group4, y = n_ARGs, fill = Group4)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.8, size = 2) +
+  facet_wrap(~Domain, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = group4_colors) +
+  theme_bw(base_size = 12) +
+  labs(title = "ARG Abundance per Genomic Compartment by Management Group", y = "Abundance (RPKG)", x = "") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_arg_context_group_rpkg)
+ggsave(file.path(OUT_DIR, "arg_context_by_group_rpkg.pdf"), p_arg_context_group_rpkg, width = 10, height = 8)
+```
+
+---
+
+# Phase 5: Community-Resistome Coupling (Q6)
+
+## Load Distance Matrices
+
+```{r load_distances}
+mag_path <- file.path(RESULTS_DIR, "data_objects", "mag_genus_counts_filt.rds")
+arg_path <- file.path(RESULTS_DIR, "data_objects", "arg_mat_contig.rds")
+
+if (file.exists(mag_path) && file.exists(arg_path)) {
+  mag_counts <- readRDS(mag_path)
+  arg_mat <- readRDS(arg_path)
+
+  cat("MAG counts:", nrow(mag_counts), "samples,", ncol(mag_counts), "taxa\n")
+  cat("ARG matrix:", nrow(arg_mat), "samples,", ncol(arg_mat), "features\n")
+
+  common_samples <- intersect(rownames(mag_counts), rownames(arg_mat))
+  cat("Common samples:", length(common_samples), "\n")
+} else {
+  cat("Data objects not found - skipping coupling analysis\n")
+  common_samples <- character(0)
+}
+```
+
+## Mantel Test
+
+```{r mantel}
+if (length(common_samples) >= 3) {
+  mag_sub <- mag_counts[common_samples, , drop = FALSE]
+  arg_sub <- arg_mat[common_samples, , drop = FALSE]
+
+  # Filter and CLR
+  mag_filt <- filter_features(mag_sub)
+  arg_filt <- filter_features(arg_sub)
+
+  if (ncol(mag_filt) > 1 && ncol(arg_filt) > 1) {
+    mag_clr <- calc_clr(mag_filt)
+    arg_clr <- calc_clr(arg_filt)
+
+    mag_dist <- calc_aitchison(mag_clr)
+    arg_dist <- calc_aitchison(arg_clr)
+
+    mantel_res <- vegan::mantel(mag_dist, arg_dist, permutations = 999)
+
+    cat("\n=== Mantel Test: Community vs Resistome ===\n")
+    cat("Mantel statistic (r):", round(mantel_res$statistic, 4), "\n")
+    cat("Significance (p-value):", round(mantel_res$signif, 4), "\n")
+  }
+}
+```
+
+## Procrustes Analysis
+
+```{r procrustes}
+if (length(common_samples) >= 3 && exists("mag_dist") && exists("arg_dist")) {
+  # PCoA
+  mag_pcoa <- cmdscale(mag_dist, k = 2)
+  arg_pcoa <- cmdscale(arg_dist, k = 2)
+
+  # Procrustes
+  proc <- vegan::procrustes(mag_pcoa, arg_pcoa)
+
+  cat("\n=== Procrustes Analysis ===\n")
+  cat("Sum of squares:", round(proc$ss, 4), "\n")
+
+  # Significance test
+  proc_test <- vegan::protest(mag_pcoa, arg_pcoa, permutations = 999)
+  cat("Correlation (m12):", round(proc_test$t0, 4), "\n")
+  cat("p-value:", round(proc_test$signif, 4), "\n")
+
+  # Plot
+  pdf(file.path(OUT_DIR, "procrustes_plot.pdf"), width = 8, height = 6)
+  plot(proc, kind = 1, main = "Procrustes: Community vs Resistome")
+  dev.off()
+
+  plot(proc, kind = 1, main = "Procrustes: Community vs Resistome")
+}
+```
+
+---
+
+# Phase 7: Analysis of ARG-Carrying Contigs (Host & Mobility)
+
+## Load Contig Taxonomy
+
+```{r load_contig_taxonomy}
+# Load GTDB taxonomy for contigs
+tax_dir <- file.path(DATA_DIR, "01_contigs/Taxonomy")
+tax_files <- list.files(tax_dir, pattern = "_combined\\.tsv$", full.names = TRUE)
+
+cat("Found", length(tax_files), "Taxonomy files\n")
+
+if (length(tax_files) > 0) {
+  tax_list <- lapply(tax_files, function(f) {
+    # Extract sample name: e.g. ISR_Org_1_combined.tsv -> ISR_Org_1
+    sample_name <- gsub("_combined\\.tsv$", "", basename(f))
+
+    # Read and select only necessary columns to save memory
+    df <- tryCatch(fread(f, select = c("contig_id", "phylum", "family", "genus")), error = function(e) NULL)
+
+    if (!is.null(df) && nrow(df) > 0) {
+      df$Sample <- sample_name
+      return(df)
+    }
+    return(NULL)
+  })
+
+  contig_taxonomy <- rbindlist(tax_list)
+  cat("Total classified contigs:", nrow(contig_taxonomy), "\n")
+} else {
+  contig_taxonomy <- data.frame(contig_id = character(), phylum = character(), Sample = character())
+  message("No taxonomy files found")
+}
+```
+
+## Integrate ARG, Host, and Mobility
+
+```{r integrate_arg_host_mobility}
+# 1. Reload ARG data at Contig level (using read_id)
+arg_files <- list.files(file.path(DATA_DIR, "01_contigs/ARG"), pattern = "\\.mapping_annotated\\.tsv$", full.names = TRUE)
+
+arg_contigs_detailed <- lapply(arg_files, function(f) {
+  sample_name <- gsub("\\.mapping_annotated\\.tsv$", "", basename(f))
+  df <- tryCatch(fread(f), error = function(e) NULL)
+
+  if (!is.null(df) && nrow(df) > 0) {
+    # Robustly find class column
+    cols <- colnames(df)
+    class_col <- head(intersect(cols, c("predicted_ARG.class", "predicted_ARG-class", "predicted_ARG_class", "drug_class")), 1)
+
+    if (length(class_col) == 0) {
+      return(NULL)
+    }
+
+    # RPKG Calculation (Same as Phases 2/3)
+    ge_info <- get_genome_equivalents(sample_name, ge_df)
+
+    df$coverage <- as.numeric(stringr::str_extract(df$read_id, "(?<=cov_)[0-9.]+"))
+
+    if (!is.null(ge_info) && !all(is.na(df$coverage))) {
+      cov_vals <- df$coverage
+      cov_vals[is.na(cov_vals)] <- 1
+      df$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    } else {
+      df$RPKG <- 1
+    }
+
+    # Keep relevant cols and rename standardized
+    out <- df %>%
+      dplyr::select(read_id, ARG_Class = dplyr::all_of(class_col), resistance_mechanism, probability, RPKG) %>%
+      dplyr::mutate(Sample = sample_name)
+    return(out)
+  }
+  return(NULL)
+}) %>% bind_rows()
+
+if (nrow(arg_contigs_detailed) > 0) {
+  cat("Total ARG-carrying contigs:", nrow(arg_contigs_detailed), "\n")
+
+  # 2. Join with Taxonomy (Host)
+  # Standardize colnames
+  arg_contigs_detailed <- arg_contigs_detailed %>%
+    dplyr::rename(ContigID = read_id, ARG_Mech = resistance_mechanism)
+
+  # Prepare taxonomy for join
+  # Taxonomy file uses 'contig_id'
+  arg_host <- arg_contigs_detailed %>%
+    dplyr::left_join(contig_taxonomy, by = c("ContigID" = "contig_id", "Sample")) %>%
+    dplyr::mutate(
+      Phylum = ifelse(is.na(phylum) | phylum == "", "Unclassified", phylum),
+      Family = ifelse(is.na(family) | family == "", "Unclassified", family)
+    )
+
+  # 3. Join with Mobility (Plasmid/Virus)
+  # Check MOB-typer (plasmids) and DeepPhage (viruses)
+  # Need to check if 'sample_id'/Header matches 'ContigID'
+
+  # Create sets for fast lookup
+  plasmid_ids <- if (exists("mobtyper_data")) paste0(mobtyper_data$Sample, "_", mobtyper_data$PlasmidID) else character(0)
+  virus_ids <- if (exists("lifestyle_data")) paste0(lifestyle_data$Sample, "_", lifestyle_data$VirusID) else character(0)
+
+  # Helper to make unique ID
+  arg_host <- arg_host %>%
+    dplyr::mutate(
+      UniqueID = paste0(Sample, "_", ContigID),
+      Mobility_Type = case_when(
+        UniqueID %in% plasmid_ids ~ "Plasmid",
+        UniqueID %in% virus_ids ~ "Virus",
+        TRUE ~ "Chromosomal" # Assumption
+      )
+    )
+
+  # Refine Mobility if available
+  if (exists("mobtyper_data")) {
+    arg_host <- arg_host %>%
+      dplyr::left_join(
+        mobtyper_data %>%
+          dplyr::mutate(UniqueID = paste0(Sample, "_", PlasmidID)) %>%
+          dplyr::select(UniqueID, Mobility_Status = Mobility),
+        by = "UniqueID"
+      )
+  }
+
+  if (exists("lifestyle_data")) {
+    arg_host <- arg_host %>%
+      dplyr::left_join(
+        lifestyle_data %>%
+          dplyr::mutate(UniqueID = paste0(Sample, "_", Header)) %>%
+          dplyr::select(UniqueID, Viral_Lifestyle = Lifestyle),
+        by = "UniqueID"
+      )
+  }
+
+  # Final classification
+  arg_host <- arg_host %>%
+    dplyr::mutate(
+      Detailed_Mobility = case_when(
+        Mobility_Type == "Plasmid" & !is.na(Mobility_Status) ~ paste0("Plasmid (", Mobility_Status, ")"),
+        Mobility_Type == "Plasmid" ~ "Plasmid (Unk)",
+        Mobility_Type == "Virus" & !is.na(Viral_Lifestyle) ~ paste0("Virus (", Viral_Lifestyle, ")"),
+        Mobility_Type == "Virus" ~ "Virus (Unk)",
+        TRUE ~ "Chromosomal"
+      )
+    )
+
+  cat("Mobility classification summary:\n")
+  print(table(arg_host$Mobility_Type))
+} else {
+  message("No ARG contigs found for detailed analysis")
+}
+```
+
+## Host Distribution of ARGs
+
+```{r plot_arg_host}
+if (exists("arg_host") && nrow(arg_host) > 0) {
+  # Add metadata
+  arg_host_meta <- arg_host %>%
+    dplyr::left_join(metadata, by = c("Sample" = "SampleID")) %>%
+    dplyr::filter(!is.na(Group4))
+
+  # 1. Host Phylum Barplot
+  # Aggregate by Phylum and Mobility
+  host_mobility_counts <- arg_host_meta %>%
+    dplyr::group_by(Phylum, Mobility_Type) %>%
+    dplyr::summarise(Count = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(Phylum = ifelse(Count < sum(Count) * 0.01, "Other", Phylum)) # Group rare phyla
+
+  p_host_mob <- ggplot(host_mobility_counts, aes(x = Phylum, y = Count, fill = Mobility_Type)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = c("Chromosomal" = "#1B9E77", "Plasmid" = "#D95F02", "Virus" = "#7570B3")) +
+    coord_flip() +
+    theme_bw() +
+    labs(title = "Taxonomic Hosts of ARG-Carrying Contigs and Their Mobility", y = "ARG Abundance (RPKG)", x = "Host Phylum")
+
+  print(p_host_mob)
+  ggsave(file.path(OUT_DIR, "arg_host_mobility_barplot.pdf"), p_host_mob, width = 8, height = 6)
+
+  # 2. Stacked Bar by Sample
+  p_host_sample <- arg_host_meta %>%
+    dplyr::group_by(Sample, Phylum) %>%
+    dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(x = Sample, y = n, fill = Phylum)) +
+    geom_bar(stat = "identity", position = "fill") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    labs(title = "Host Phylum Composition of ARG-Carrying Contigs", y = "Fraction of ARGs")
+
+  print(p_host_sample)
+  ggsave(file.path(OUT_DIR, "arg_host_composition_barplot.pdf"), p_host_sample, width = 12, height = 6)
+
+  # 3. Stacked Bar by Sample (Abundance RPKG)
+  p_host_sample_rpkg <- arg_host_meta %>%
+    dplyr::group_by(Sample, Phylum) %>%
+    dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(x = Sample, y = n, fill = Phylum)) +
+    geom_bar(stat = "identity", position = "stack") + # Stack instead of fill
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    labs(title = "Host Phylum Abundance of ARG-Carrying Contigs", y = "Abundance (RPKG)")
+
+  print(p_host_sample_rpkg)
+  ggsave(file.path(OUT_DIR, "arg_host_composition_barplot_rpkg.pdf"), p_host_sample_rpkg, width = 12, height = 6)
+
+  # Grouped Summary Plot: Host Phylum Abundance (Mean + SE) by Group4
+  # 1. Sum RPKG per Sample per Phylum
+  host_phylum_abundance <- arg_host_meta %>%
+    dplyr::group_by(Sample, Group4, Phylum) %>%
+    dplyr::summarise(TotalAbundance = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+  # 2. Mean/SE per Group4
+  host_summary_group <- host_phylum_abundance %>%
+    dplyr::group_by(Group4, Phylum) %>%
+    dplyr::summarise(
+      Mean = mean(TotalAbundance, na.rm = TRUE),
+      SD = sd(TotalAbundance, na.rm = TRUE),
+      n = n(),
+      SE = SD / sqrt(n),
+      .groups = "drop"
+    )
+
+  # Filter to top phyla to avoid overcrowding if needed, or just plot all
+  # Use same filtering as main barplot (Group rare phyla?)
+  # The main barplot grouped rare phyla into "Other". arg_host_meta does NOT have "Other".
+  # host_mobility_counts (Line 1200) created "Other".
+  # Let's apply similar logic: Keep top N phyla, group rest to Other.
+
+  top_phyla <- host_summary_group %>%
+    group_by(Phylum) %>%
+    summarise(m = mean(Mean)) %>%
+    arrange(desc(m)) %>%
+    head(10) %>%
+    pull(Phylum)
+
+  host_summary_group_filt <- host_summary_group %>%
+    mutate(Phylum = ifelse(Phylum %in% top_phyla, Phylum, "Other")) %>%
+    group_by(Group4, Phylum) %>%
+    summarise(Mean = sum(Mean), SE = sqrt(sum(SE^2)), .groups = "drop") # Approximate SE merging
+
+  # Calculate CLD on the filtered groups
+  # Re-create raw data stats with zero-filling
+
+  # 1. Aggregate to 'Other' grouping first
+  host_abundance_grouped <- host_phylum_abundance %>%
+    mutate(Phylum = ifelse(Phylum %in% top_phyla, Phylum, "Other")) %>%
+    group_by(Sample, Group4, Phylum) %>%
+    summarise(TotalAbundance = sum(TotalAbundance), .groups = "drop")
+
+  # 2. Zero-fill
+  host_abundance_filled <- complete_with_zeros(host_abundance_grouped, "Phylum", "TotalAbundance")
+
+  cld_res_host <- list()
+  for (phy in unique(host_abundance_filled$Phylum)) {
+    sub <- host_abundance_filled %>% filter(Phylum == phy)
+    # Using 'TotalAbundance' as the value
+    res <- get_cld_letters_generic(sub, "TotalAbundance", "Group4")
+    res$Phylum <- phy
+    cld_res_host[[phy]] <- res
+  }
+  cld_host_df <- bind_rows(cld_res_host)
+
+  host_summary_group_filt <- host_summary_group_filt %>%
+    left_join(cld_host_df, by = c("Group4", "Phylum")) %>%
+    mutate(Letter = ifelse(is.na(Letter), "", Letter))
+
+  p_host_grouped_errorbar <- ggplot(host_summary_group_filt, aes(x = Group4, y = Mean + 1, fill = Phylum)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9)) +
+    geom_errorbar(aes(ymin = pmax(1, Mean - SE + 1), ymax = Mean + SE + 1),
+      width = 0.2, position = position_dodge(0.9)
+    ) +
+    geom_text(aes(label = Letter, y = Mean + SE + 1 + 0.1 * (Mean + 1)),
+      position = position_dodge(0.9), vjust = 0, size = 3
+    ) +
+    scale_y_log10() +
+    theme_bw(base_size = 12) +
+    labs(title = "Mean ARG Host Abundance by Phylum and Management Group", y = "Mean Abundance (RPKG, log scale)", x = "")
+
+  print(p_host_grouped_errorbar)
+  ggsave(file.path(OUT_DIR, "arg_host_composition_grouped_errorbar.pdf"), p_host_grouped_errorbar, width = 12, height = 6)
+}
+```
+
+## Sankey: Host -> Mobility -> ARG Class
+
+```{r sankey_host_arg}
+if (exists("arg_host_meta") && requireNamespace("ggalluvial", quietly = TRUE)) {
+  library(ggalluvial)
+
+  # Filter for top flows to avoid clutter
+  sankey_df <- arg_host_meta %>%
+    dplyr::mutate(
+      Phylum = as.character(Phylum),
+      ARG_Class = as.character(ARG_Class)
+    ) %>%
+    dplyr::filter(Phylum != "Unclassified")
+
+  # Get top 5 Phyla and Top 5 Classes
+  top_phyla <- sankey_df %>%
+    dplyr::group_by(Phylum) %>%
+    dplyr::summarise(n = sum(RPKG, na.rm = TRUE)) %>%
+    dplyr::arrange(desc(n)) %>%
+    head(5) %>%
+    pull(Phylum)
+  top_classes <- sankey_df %>%
+    dplyr::group_by(ARG_Class) %>%
+    dplyr::summarise(n = sum(RPKG, na.rm = TRUE)) %>%
+    dplyr::arrange(desc(n)) %>%
+    head(6) %>%
+    pull(ARG_Class)
+
+  sankey_nodes <- sankey_df %>%
+    dplyr::filter(Phylum %in% top_phyla, ARG_Class %in% top_classes) %>%
+    dplyr::group_by(Phylum, Mobility_Type, ARG_Class) %>%
+    dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(sankey_nodes) > 0) {
+    p_sankey_host <- ggplot(sankey_nodes, aes(axis1 = Phylum, axis2 = Mobility_Type, axis3 = ARG_Class, y = n)) +
+      geom_alluvium(aes(fill = Mobility_Type), width = 1 / 12) +
+      geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+      geom_label(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+      scale_fill_manual(values = c("Chromosomal" = "#1B9E77", "Plasmid" = "#D95F02", "Virus" = "#7570B3")) +
+      theme_void() +
+      labs(title = "ARG Flow: Taxonomic Host \u2192 Genomic Context \u2192 Drug Class")
+
+    print(p_sankey_host)
+    ggsave(file.path(OUT_DIR, "arg_host_mobility_sankey.pdf"), p_sankey_host, width = 10, height = 7)
+  }
+}
+```
+
+## Phase 6: Summary and Save Results
+
+## Summary Table
+
+```{r summary_table}
+# Build summary
+summary_items <- list()
+
+# Viral lifestyle
+if (exists("temperate_frac") && nrow(temperate_frac) > 0) {
+  summary_items$viral <- c(
+    N = length(unique(lifestyle_data$Sample)),
+    Metric = paste0("Temperate: ", round(mean(temperate_frac$fraction, na.rm = TRUE) * 100, 1), "%")
+  )
+}
+
+# Plasmid mobility
+if (exists("mobility_counts")) {
+  conj_frac <- mobility_counts %>% filter(Mobility == "Conjugative")
+  summary_items$plasmid <- c(
+    N = length(unique(mobtyper_data$Sample)),
+    Metric = paste0("Conjugative: ", round(mean(conj_frac$fraction, na.rm = TRUE) * 100, 1), "%")
+  )
+}
+
+# ARG context
+if (exists("arg_fractions")) {
+  mobile_frac <- arg_fractions %>% filter(Domain %in% c("Plasmids", "Viruses"))
+  summary_items$arg_context <- c(
+    N = length(unique(arg_context$Sample)),
+    Metric = paste0("Mobile ARGs: ", round(mean(mobile_frac$fraction, na.rm = TRUE) * 100, 1), "%")
+  )
+}
+
+# Coupling
+if (exists("mantel_res")) {
+  summary_items$mantel <- c(N = length(common_samples), Metric = paste0("r = ", round(mantel_res$statistic, 3)))
+}
+if (exists("proc_test")) {
+  summary_items$procrustes <- c(N = length(common_samples), Metric = paste0("cor = ", round(proc_test$t0, 3)))
+}
+
+cat("\n=== Analysis Summary ===\n")
+for (nm in names(summary_items)) {
+  cat(nm, ":", summary_items[[nm]]["Metric"], "(n =", summary_items[[nm]]["N"], ")\n")
+}
+```
+
+## Save Results
+
+```{r save_results}
+# Save RDS objects
+if (exists("lifestyle_data")) {
+  saveRDS(lifestyle_data, file.path(RESULTS_DIR, "data_objects", "viral_lifestyle.rds"))
+  fwrite(lifestyle_counts, file.path(OUT_DIR, "viral_lifestyle_summary.tsv"), sep = "\t")
+}
+
+if (exists("mobtyper_data")) {
+  saveRDS(mobtyper_data, file.path(RESULTS_DIR, "data_objects", "plasmid_mobility.rds"))
+  fwrite(mobility_counts, file.path(OUT_DIR, "plasmid_mobility_summary.tsv"), sep = "\t")
+}
+
+if (exists("arg_context")) {
+  saveRDS(arg_context, file.path(RESULTS_DIR, "data_objects", "arg_genomic_context.rds"))
+  fwrite(arg_fractions, file.path(OUT_DIR, "arg_context_summary.tsv"), sep = "\t")
+}
+
+if (exists("arg_mobility_counts")) {
+  fwrite(arg_mobility_counts, file.path(OUT_DIR, "arg_on_mobility_summary.tsv"), sep = "\t")
+}
+
+if (exists("arg_lifestyle_counts")) {
+  fwrite(arg_lifestyle_counts, file.path(OUT_DIR, "arg_on_lifestyle_summary.tsv"), sep = "\t")
+}
+
+cat("\nResults saved to:", OUT_DIR, "\n")
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

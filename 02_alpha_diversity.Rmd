@@ -1,0 +1,2152 @@
+---
+title: "02 - Alpha Diversity Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# Q2: Alpha Diversity via Hill Numbers
+
+**Question:** Does within-sample diversity differ among Group4 in prokaryotes, plasmids, and viruses?
+
+## Load Setup
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+library(emmeans)
+library(multcomp)
+library(multcompView)
+
+OUT_DIR <- file.path(RESULTS_DIR, "02_alpha_diversity")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+```
+
+## Hill Number Function
+
+Hill numbers:
+- **q=0**: Richness (number of taxa)
+- **q=1**: exp(Shannon) - effective number of common taxa
+- **q=2**: 1/Simpson - effective number of dominant taxa
+
+```{r hill_function}
+calc_hill <- function(count_matrix) {
+  rel_abund <- prop.table(as.matrix(count_matrix), 1)
+
+  q0 <- rowSums(rel_abund > 0)
+  q1 <- exp(vegan::diversity(rel_abund, index = "shannon"))
+  q2 <- 1 / vegan::diversity(rel_abund, index = "simpson")
+
+  data.frame(SampleID = rownames(count_matrix), q0 = q0, q1 = q1, q2 = q2)
+}
+```
+
+---
+
+# 0. Reads (Rarefied to Equal Depth)
+
+**Scientific Rationale:** Read-level taxonomy from Kraken2 provides the most comprehensive view of community composition. We rarefy to the minimum library size to ensure fair comparisons of alpha diversity across samples.
+
+## Load and Process Read Taxonomy
+
+```{r load_reads}
+# Load all read taxonomy files
+reads_dir <- file.path(DATA_DIR, "00_reads/Taxonomy")
+read_files <- list.files(reads_dir, pattern = "_combined\\.tsv$", full.names = TRUE)
+
+# Read and combine all files
+read_data_list <- lapply(read_files, fread)
+read_data <- rbindlist(read_data_list, fill = TRUE)
+
+# Filter to valid Bacteria/Archaea (GTDB + NT)
+# Filter to valid Bacteria/Archaea/Fungi (GTDB + NT) and normalize
+read_data_clean <- read_data %>%
+  correct_gtdb_taxonomy() %>%
+  mutate(
+    # Normalize prefixes (k__, p__, etc.)
+    kingdom = gsub("^[kd]__", "", kingdom),
+    phylum = gsub("^p__", "", phylum),
+    class = gsub("^c__", "", class),
+    order = gsub("^o__", "", order),
+    family = gsub("^f__", "", family),
+    genus = gsub("^g__", "", genus),
+    species = gsub("^s__", "", species)
+  ) # %>%
+# dplyr::filter(kingdom %in% c("Bacteria", "Archaea")) # Removed filter to include all kingdoms
+
+# Function to plot composition with Phylum-based Coloring
+# Simple Stacked Barplot Function
+# Generic Plotting Function for Composition
+plot_composition_bar <- function(df_wide, metadata, rank_col = "DisplayTaxon", metric_label = "Relative Abundance", n_top = 20) {
+  # Convert wide to long
+  df_long <- df_wide %>%
+    rownames_to_column("SampleID") %>%
+    pivot_longer(-SampleID, names_to = "Taxon", values_to = "Value") %>%
+    left_join(metadata, by = "SampleID")
+
+  # Identify Top Taxa by Mean Value
+  top_taxa <- df_long %>%
+    group_by(Taxon) %>%
+    summarise(MeanVal = mean(Value, na.rm = TRUE)) %>%
+    top_n(n_top, MeanVal) %>%
+    pull(Taxon)
+
+  # Group "Other"
+  df_plot <- df_long %>%
+    mutate(DisplayTaxon = ifelse(Taxon %in% top_taxa, Taxon, "Other")) %>%
+    group_by(SampleID, Group4, DisplayTaxon) %>%
+    summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+
+  # Order Taxa
+  df_plot$DisplayTaxon <- factor(df_plot$DisplayTaxon, levels = c(top_taxa, "Other"))
+
+  # Palette
+  n_colors <- length(top_taxa)
+  my_palette <- colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))(n_colors)
+  names(my_palette) <- top_taxa
+  final_palette <- c(my_palette, "Other" = "grey85")
+
+  # Plot
+  ggplot(df_plot, aes(x = SampleID, y = Value, fill = DisplayTaxon)) +
+    geom_bar(stat = "identity", width = 0.9) +
+    facet_grid(~Group4, scales = "free_x", space = "free") +
+    scale_fill_manual(values = final_palette) +
+    theme_bw(base_size = 12) +
+    labs(
+      y = metric_label, x = "", fill = "Taxon"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10),
+      legend.position = "right"
+    )
+}
+
+cat("## Taxonomic Composition (Reads)\n\n")
+
+# Phylum Level
+# Prepare data for Read Plots (Phylum Level)
+cat("Read Data Clean Rows:", nrow(read_data_clean), "\n")
+
+if (nrow(read_data_clean) > 0) {
+  prep_reads_phylum <- read_data_clean %>%
+    filter(!is.na(phylum) & phylum != "") %>%
+    group_by(sample, phylum) %>%
+    summarise(Count = sum(count, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(prep_reads_phylum) > 0) {
+    # Ensure it's a dataframe and ungrouped
+    prep_reads_phylum <- as.data.frame(prep_reads_phylum)
+
+    cat("Cols before pivot:", paste(colnames(prep_reads_phylum), collapse = ", "), "\n")
+
+    prep_reads_phylum <- prep_reads_phylum %>%
+      pivot_wider(names_from = "phylum", values_from = "Count", values_fill = 0)
+
+    # Check if sample column exists before converting to rownames
+    if ("sample" %in% colnames(prep_reads_phylum)) {
+      prep_reads_phylum <- prep_reads_phylum %>% column_to_rownames("sample")
+    } else {
+      stop("Sample column missing after pivot.")
+    }
+
+    # Relative Abundance
+    prep_reads_phylum_rel <- prop.table(as.matrix(prep_reads_phylum), 1) %>% as.data.frame()
+
+    cat("### Phylum Level: Relative Abundance\n")
+    print(plot_composition_bar(prep_reads_phylum_rel, metadata, metric_label = "Relative Abundance (Reads - Phylum)"))
+
+    cat("### Phylum Level: Read Counts\n")
+    print(plot_composition_bar(as.data.frame(prep_reads_phylum), metadata, metric_label = "Read Counts (Phylum)"))
+  } else {
+    message("No phylum data available for reads after summarization.")
+  }
+} else {
+  message("read_data_clean is empty.")
+}
+
+# Prepare data for Alpha Diversity (Genus level)
+read_genus <- read_data_clean %>%
+  filter(!is.na(genus) & genus != "" & genus != "-") %>%
+  dplyr::select(genus, count, sample) %>%
+  group_by(sample, genus) %>%
+  summarise(count = sum(count, na.rm = TRUE), .groups = "drop")
+
+# Convert to wide matrix (samples x genus)
+read_genus_wide <- read_genus %>%
+  pivot_wider(names_from = genus, values_from = count, values_fill = 0) %>%
+  column_to_rownames("sample")
+
+# Align with metadata
+common_samples_reads <- intersect(rownames(read_genus_wide), rownames(metadata))
+read_genus_mat <- as.matrix(read_genus_wide[common_samples_reads, , drop = FALSE])
+
+cat("Samples:", nrow(read_genus_mat), "\n")
+cat("Genera:", ncol(read_genus_mat), "\n")
+cat("Library sizes:\n")
+print(rowSums(read_genus_mat))
+```
+
+## Rarefaction
+
+```{r rarefy_reads}
+# Load overview mapping to get total sequencing depth
+mapping_path <- file.path(DATA_DIR, "overview_mapping.tsv")
+overview_map <- as.data.frame(fread(mapping_path))
+overview_map <- overview_map %>%
+  dplyr::select("Sample", "Total_Reads") %>%
+  dplyr::rename(SampleID = "Sample")
+
+# Filter overview map to samples present in data
+common_samples <- intersect(rownames(read_genus_mat), overview_map$SampleID)
+overview_map <- overview_map %>% filter(SampleID %in% common_samples)
+read_genus_mat <- read_genus_mat[common_samples, , drop = FALSE]
+
+# Determine minimum total depth from mapping file
+min_total_depth <- min(overview_map$Total_Reads)
+cat("Minimum Total Reads (from overview_mapping.tsv):", min_total_depth, "\n")
+
+# Custom rarefaction function using binomial sampling based on total depth
+# This accounts for the fact that 'read_genus_mat' is a subset (filtered genera),
+# but we want to simulate equal sampling effort based on the ORIGINAL total library size.
+rarefy_custom <- function(counts, sample_id, mapping_df, target_depth) {
+  sample_total <- mapping_df$Total_Reads[mapping_df$SampleID == sample_id]
+  prob <- target_depth / sample_total
+
+  if (prob >= 1) {
+    return(counts)
+  }
+
+  # Binomial sampling
+  rbinom(length(counts), size = counts, prob = prob)
+}
+
+# Apply rarefaction
+read_rarefied <- read_genus_mat
+set.seed(42)
+
+for (i in 1:nrow(read_rarefied)) {
+  samp <- rownames(read_rarefied)[i]
+  read_rarefied[i, ] <- rarefy_custom(read_rarefied[i, ], samp, overview_map, min_total_depth)
+}
+
+# Remove genera with zero counts after rarefaction
+read_rarefied <- read_rarefied[, colSums(read_rarefied) > 0]
+cat("Genera after rarefaction:", ncol(read_rarefied), "\n")
+min_depth <- min_total_depth # For plot title
+```
+
+## Taxonomic Composition (Rarefied Reads)
+
+```{r tax_composition_rarefied, fig.width=12, fig.height=7}
+# Create Genus -> Phylum mapping from original data
+genus_phylum_map <- read_data_clean %>%
+  dplyr::filter(!is.na(genus) & genus != "" & !is.na(phylum) & phylum != "") %>%
+  dplyr::select(genus, phylum) %>%
+  distinct(genus, .keep_all = TRUE) # Keep one mapping per genus
+
+# Convert rarefied matrix (genus counts) to long format
+read_rarefied_long <- as.data.frame(read_rarefied) %>%
+  tibble::rownames_to_column("SampleID") %>%
+  tidyr::pivot_longer(-SampleID, names_to = "genus", values_to = "Count") %>%
+  dplyr::filter(Count > 0)
+
+# Join with mapping and summarize by Phylum
+rarefied_phylum <- read_rarefied_long %>%
+  left_join(genus_phylum_map, by = "genus") %>%
+  mutate(phylum = ifelse(is.na(phylum), "Unknown/Unmapped", phylum)) %>%
+  group_by(SampleID, phylum) %>%
+  summarise(Count = sum(Count), .groups = "drop")
+
+# Convert back to Wide format (Sample x Phylum) for the plotting function
+rarefied_phylum_wide <- rarefied_phylum %>%
+  tidyr::pivot_wider(names_from = "phylum", values_from = "Count", values_fill = 0) %>%
+  tibble::column_to_rownames("SampleID")
+
+# Convert to Relative Abundance
+rarefied_phylum_rel <- prop.table(as.matrix(rarefied_phylum_wide), 1) %>% as.data.frame()
+
+# Plot
+cat("### Rarefied Reads Composition (Phylum Level)\n")
+print(plot_composition_bar(rarefied_phylum_rel, metadata, metric_label = "Relative Abundance (Rarefied)"))
+```
+
+## Alpha Diversity (Rarefied)
+
+```{r alpha_helpers}
+library(ggpubr)
+library(rstatix)
+
+# Enhanced Alpha Diversity Plotting Function (STHDA Style)
+plot_hill_stats <- function(hill_data, domain_name, group_col = "Group4", palette = group4_colors) {
+  # Reshape to longer format for faceting
+  df_long <- hill_data %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+    mutate(q_label = recode(q,
+      "q0" = "q=0 (Richness)",
+      "q1" = "q=1 (exp(Shannon))",
+      "q2" = "q=2 (1/Simpson)"
+    )) %>%
+    filter(!is.na(Value) & !is.na(.data[[group_col]])) # Remove NAs
+
+  # Ensure group column is a factor
+  df_long[[group_col]] <- as.factor(df_long[[group_col]])
+
+  # Check if sufficient data exists
+  if (nrow(df_long) == 0) {
+    message("No valid data for ", domain_name)
+    return(NULL)
+  }
+
+  # Perform Pairwise Comparisons (Wilcoxon)
+  # Wrap in tryCatch to handle cases with constant values or insufficient groups
+  stat.test <- tryCatch(
+    {
+      df_long %>%
+        group_by(q_label) %>%
+        wilcox_test(as.formula(paste("Value ~", group_col))) %>%
+        adjust_pvalue(method = "BH") %>%
+        add_significance("p.adj") %>%
+        add_xy_position(x = group_col)
+    },
+    error = function(e) {
+      message("Statistical testing failed for ", domain_name, ": ", e$message)
+      return(NULL)
+    }
+  )
+
+  # Plot
+  p <- ggplot(df_long, aes(x = .data[[group_col]], y = Value, fill = .data[[group_col]])) +
+    # Jitter points for data distribution
+    geom_jitter(width = 0.2, alpha = 0.6, size = 1.5, color = "grey30") +
+    # Boxplot on top (optional: make it transparent or use width)
+    geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = NA) +
+    facet_wrap(~q_label, scales = "free_y") +
+    scale_fill_manual(values = palette) +
+    theme_bw(base_size = 12) +
+    labs(
+      title = paste(domain_name, "Alpha Diversity"),
+      y = "Hill Number", x = ""
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.background = element_rect(fill = "grey95")
+    )
+
+  # Only add stats if we successfully calculated them and have rows (matches found)
+  if (!is.null(stat.test) && nrow(stat.test) > 0) {
+    p <- p + stat_pvalue_manual(
+      stat.test,
+      label = "p.adj.signif",
+      tip.length = 0.01,
+      hide.ns = TRUE,
+      step.increase = 0.1
+    )
+  }
+
+  return(p)
+}
+
+# Statistical Analysis and Plotting Function (LM/GLM/Kruskal)
+analyze_and_plot_lm <- function(hill_data, domain_name, group_col = "Group4", palette = group4_colors, model_type = "lm") {
+  library(emmeans)
+  library(multcomp)
+  library(multcompView)
+  library(gridExtra)
+  library(rstatix)
+  library(dplyr)
+
+  # Reshape to longer format
+  df_long <- hill_data %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+    mutate(q_label = recode(q,
+      "q0" = "q=0 (Richness)",
+      "q1" = "q=1 (exp(Shannon))",
+      "q2" = "q=2 (1/Simpson)"
+    )) %>%
+    filter(!is.na(Value) & !is.na(.data[[group_col]]))
+
+  df_long[[group_col]] <- as.factor(df_long[[group_col]])
+
+  # Validate model type
+  model_type <- match.arg(model_type, c("lm", "gamma", "kruskal"))
+
+  # Initialize lists
+  main_plots <- list()
+  diag_plots <- list()
+
+  # Iterate over q indices
+  for (cur_q in unique(df_long$q_label)) {
+    sub_data <- df_long %>% filter(q_label == cur_q)
+
+    # Check if we have enough data/groups for stats
+    n_groups <- length(unique(sub_data[[group_col]]))
+    if (n_groups < 2) {
+      message(paste("Skipping stats for", cur_q, ": < 2 groups present."))
+      p <- ggplot(sub_data, aes(x = .data[[group_col]], y = Value, color = .data[[group_col]])) +
+        geom_jitter(width = 0.2) +
+        labs(title = cur_q, subtitle = "Not enough groups for stats") +
+        theme_bw()
+      main_plots[[cur_q]] <- p
+      next
+    }
+
+    # --- MODEL FITTING & STATS ---
+
+    if (model_type == "kruskal") {
+      # Kruskal-Wallis + Dunn's Test
+      model_desc <- "Kruskal-Wallis + Dunn's Test"
+
+      # 1. Kruskal Test (Global)
+      kw <- kruskal.test(as.formula(paste("Value ~", group_col)), data = sub_data)
+
+      # 2. Dunn's Test (Pairwise)
+      dunn <- tryCatch(
+        {
+          sub_data %>% dunn_test(as.formula(paste("Value ~", group_col)), p.adjust.method = "fdr")
+        },
+        error = function(e) {
+          message(paste("Dunn test failed for", cur_q, ":", e$message))
+          return(NULL)
+        }
+      )
+
+      if (is.null(dunn) || nrow(dunn) == 0) {
+        # Fallback
+        cld_res <- data.frame(Group = unique(sub_data[[group_col]]), .group = "", stringsAsFactors = FALSE)
+        summ <- sub_data %>%
+          dplyr::group_by(.data[[group_col]]) %>%
+          summarise(MaxVal = max(Value, na.rm = TRUE), Median = median(Value, na.rm = TRUE), .groups = "drop") %>%
+          dplyr::rename(Group = all_of(group_col))
+        cld_res <- cld_res %>% left_join(summ, by = "Group")
+      } else {
+        # 3. Generate CLD from Dunn's p-values
+        # Create p-value vector for multcompLetters
+        # Format: "Group1-Group2" = p.adj
+        p_vec <- setNames(dunn$p.adj, paste(dunn$group1, dunn$group2, sep = "-"))
+
+        # multcompLetters expects names like "A-B".
+        # dunn_test output group1/group2 are names.
+
+        letters_list <- tryCatch(
+          {
+            multcompLetters(p_vec, compare = "<", threshold = 0.05, Letters = letters, reversed = TRUE)
+          },
+          error = function(e) {
+            # Fallback if error (e.g. all same)
+            list(Letters = setNames(rep("a", length(unique(sub_data[[group_col]]))), unique(sub_data[[group_col]])))
+          }
+        )
+
+        # Create result dataframe for plotting letters
+        # For Kruskal, we usually place letters above the max value or median+spread.
+        # Let's compute summary stats (Max) for placement.
+
+        cld_res <- data.frame(
+          Group = names(letters_list$Letters),
+          Letter = letters_list$Letters,
+          stringsAsFactors = FALSE
+        )
+
+        # Get Y-positions (Max + offset)
+        # Group summaries
+        summ <- sub_data %>%
+          dplyr::group_by(.data[[group_col]]) %>%
+          summarise(MaxVal = max(Value, na.rm = TRUE), Median = median(Value, na.rm = TRUE), .groups = "drop") %>%
+          dplyr::rename(Group = all_of(group_col))
+
+        cld_res <- cld_res %>% left_join(summ, by = "Group")
+
+        # Rename column for consistent plotting code below (Map Letter to .group)
+        cld_res <- cld_res %>% dplyr::rename(.group = Letter)
+      }
+    } else {
+      # LM or GLM
+      if (model_type == "gamma") {
+        min_val <- min(sub_data$Value, na.rm = TRUE)
+        if (min_val <= 0) {
+          # warning(paste("Gamma GLM requires positive values. Adjusted", cur_q))
+          sub_data$Value <- sub_data$Value + 1e-6
+        }
+        mod_fit <- glm(as.formula(paste("Value ~", group_col)), data = sub_data, family = Gamma(link = "log"))
+        model_desc <- "Gamma GLM (log link)"
+        emm_type <- "response"
+      } else {
+        mod_fit <- lm(as.formula(paste("Value ~", group_col)), data = sub_data)
+        model_desc <- "Linear Model (Gaussian)"
+        emm_type <- "response"
+      }
+
+      # EMM & CLD
+      emm <- emmeans(mod_fit, as.formula(paste("~", group_col)), type = emm_type)
+
+      # FIX: Force as.data.frame to avoid 'rename' error on summary_emm object
+      cld_obj <- cld(emm, alpha = 0.05, Letters = letters, adjust = "fdr", reversed = TRUE)
+      cld_res <- as.data.frame(cld_obj)
+      # Explicitly strip summary_emm class which confuses dplyr::rename
+      class(cld_res) <- "data.frame"
+
+      cld_res <- cld_res %>%
+        dplyr::rename(Group = all_of(group_col)) %>%
+        mutate(q_label = cur_q)
+
+      cld_res$.group <- trimws(cld_res$.group)
+      if ("response" %in% colnames(cld_res)) cld_res <- cld_res %>% dplyr::rename(emmean = response)
+    }
+
+    # --- PLOTTING ---
+
+    p <- ggplot()
+
+    if (model_type == "kruskal") {
+      # Plot: Boxplot + Jitter + Letters (at Max)
+      p <- p +
+        geom_boxplot(
+          data = sub_data, aes(x = .data[[group_col]], y = Value, fill = .data[[group_col]]),
+          alpha = 0.6, outlier.shape = NA
+        ) +
+        geom_jitter(
+          data = sub_data, aes(x = .data[[group_col]], y = Value),
+          width = 0.2, alpha = 0.4, size = 1.5
+        ) +
+        geom_text(
+          data = cld_res, aes(x = Group, y = MaxVal, label = .group),
+          vjust = -0.8, size = 5, fontface = "bold", color = "black"
+        ) +
+        scale_fill_manual(values = palette) +
+        labs(subtitle = paste("Model:", model_desc, "\nLetters: Dunn's Test (BH-adjusted p < 0.05)"))
+    } else {
+      # Plot: Mean + ErrorBar + Jitter + Letters
+      p <- p +
+        geom_jitter(
+          data = sub_data, aes(x = .data[[group_col]], y = Value, color = .data[[group_col]]),
+          width = 0.2, alpha = 0.4, size = 1.5
+        ) +
+        geom_errorbar(
+          data = cld_res, aes(x = Group, ymin = lower.CL, ymax = upper.CL),
+          width = 0.2, size = 1, color = "black"
+        ) +
+        geom_point(
+          data = cld_res, aes(x = Group, y = emmean),
+          size = 3, color = "black"
+        ) +
+        geom_text(
+          data = cld_res, aes(x = Group, y = upper.CL, label = .group),
+          vjust = -0.5, size = 5, fontface = "bold"
+        ) +
+        scale_color_manual(values = palette) +
+        labs(subtitle = paste("Model:", model_desc, "\nError Bars: 95% CI (EMM)\nP-adjust: FDR"))
+    }
+
+    # Common Styling
+    p <- p +
+      facet_wrap(~q_label, scales = "free_y") +
+      theme_bw(base_size = 12) +
+      labs(y = "Hill Number", x = "", title = cur_q) +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    main_plots[[cur_q]] <- p
+
+    # --- DIAGNOSTICS ---
+    if (model_type != "kruskal") {
+      if (model_type == "gamma") {
+        resids <- residuals(mod_fit, type = "deviance")
+        fitted_vals <- fitted(mod_fit)
+        std_resids <- rstandard(mod_fit)
+      } else {
+        resids <- residuals(mod_fit)
+        fitted_vals <- fitted(mod_fit)
+        std_resids <- rstandard(mod_fit)
+      }
+
+      diag_df <- data.frame(Fitted = fitted_vals, Residuals = resids, StdResid = std_resids)
+
+      p_resid <- ggplot(diag_df, aes(x = Fitted, y = Residuals)) +
+        geom_point(alpha = 0.5, color = "blue") +
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        labs(title = paste("Resid vs Fitted:", cur_q)) +
+        theme_gray(base_size = 9)
+
+      p_qq <- ggplot(diag_df, aes(sample = StdResid)) +
+        stat_qq(alpha = 0.5) +
+        stat_qq_line(color = "red") +
+        labs(title = paste("Q-Q Plot:", cur_q)) +
+        theme_gray(base_size = 9)
+
+      diag_plots[[cur_q]] <- arrangeGrob(p_resid, p_qq, ncol = 2)
+    }
+  }
+
+  # Combine
+  final_main <- ggarrange(plotlist = main_plots, ncol = 3, nrow = 1, common.legend = TRUE)
+  annotated_main <- annotate_figure(final_main, top = text_grob(paste("Analysis:", domain_name), face = "bold", size = 14))
+
+  if (model_type != "kruskal") {
+    final_diag <- ggarrange(plotlist = diag_plots, ncol = 1, nrow = 3)
+    annotated_diag <- annotate_figure(final_diag, top = text_grob(paste("Diagnostics:", domain_name, "(", model_type, ")"), face = "bold", size = 12))
+    return(list(main = annotated_main, diagnostics = annotated_diag))
+  } else {
+    return(list(main = annotated_main, diagnostics = NULL))
+  }
+}
+```
+
+```{r alpha_reads}
+hill_reads <- calc_hill(read_rarefied)
+hill_reads$Domain <- "Reads"
+hill_reads_meta <- left_join(hill_reads, metadata, by = "SampleID")
+
+# Generate Plot
+p_reads <- plot_hill_stats(hill_reads_meta, paste0("Reads (Rarefied to ", format(min_depth, big.mark = ","), ")"))
+print(p_reads)
+ggsave(file.path(OUT_DIR, "alpha_reads_boxplot.pdf"), p_reads, width = 10, height = 6)
+```
+
+## Kruskal-Wallis Tests (Reads)
+
+```{r stats_reads}
+stats_reads <- hill_reads_meta %>%
+  pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+  group_by(q) %>%
+  summarise(p_value = kruskal.test(Value ~ Group4)$p.value, .groups = "drop")
+
+knitr::kable(stats_reads, caption = "Kruskal-Wallis: Reads Hill Numbers ~ Group4", digits = 4)
+```
+
+## Linear Model Analysis (Reads)
+
+```{r lm_reads, fig.width=12, fig.height=9}
+# Linear Model (Gaussian)
+res_lm_reads <- analyze_and_plot_lm(hill_reads_meta, "Reads", model_type = "lm")
+print(res_lm_reads$main)
+ggsave(file.path(OUT_DIR, "alpha_reads_lm_main.pdf"), res_lm_reads$main, width = 12, height = 6)
+
+# Diagnostics (Gaussian)
+print(res_lm_reads$diagnostics)
+ggsave(file.path(OUT_DIR, "alpha_reads_lm_diagnostics.pdf"), res_lm_reads$diagnostics, width = 12, height = 9)
+
+# Gamma GLM (Robust check)
+cat("\n### Gamma GLM Check (Reads)\n")
+res_gamma_reads <- analyze_and_plot_lm(hill_reads_meta, "Reads", model_type = "gamma")
+print(res_gamma_reads$main)
+ggsave(file.path(OUT_DIR, "alpha_reads_gamma_main.pdf"), res_gamma_reads$main, width = 12, height = 6)
+ggsave(file.path(DATA_DIR, "figures/supplementary/FigS2_alpha_gamma_reads.pdf"), res_gamma_reads$main, width = 12, height = 6)
+ggsave(file.path(OUT_DIR, "FigS2_alpha_gamma_reads.pdf"), res_gamma_reads$main, width = 12, height = 6)
+
+# Kruskal-Wallis + Dunn (Non-parametric)
+cat("\n### Kruskal-Wallis Check (Reads)\n")
+res_kruskal_reads <- analyze_and_plot_lm(hill_reads_meta, "Reads", model_type = "kruskal")
+print(res_kruskal_reads$main)
+ggsave(file.path(OUT_DIR, "alpha_reads_kruskal_main.pdf"), res_kruskal_reads$main, width = 12, height = 6)
+```
+
+---
+
+# 1. Prokaryotes
+
+## Load and Process MAG Data to Species Level
+
+```{r load_mag_data}
+# Load CoverM results and taxonomy
+mag_counts_raw <- fread(file.path(DATA_DIR, "02_MAGs/coverage/coverm_results.tsv"))
+mag_stats <- fread(file.path(DATA_DIR, "02_MAGs/taxonomy/mag_stats_summary_with_taxonomy.tsv"))
+
+# Extract Read Count columns
+count_cols <- grep("Read Count", colnames(mag_counts_raw), value = TRUE)
+mag_count_mat <- mag_counts_raw %>%
+  dplyr::select(Genome, all_of(count_cols)) %>%
+  column_to_rownames("Genome")
+colnames(mag_count_mat) <- gsub("\\.sorted Read Count", "", colnames(mag_count_mat))
+
+# Parse taxonomy - extract species
+mag_tax_parsed <- mag_stats %>%
+  dplyr::select(MAG_ID, classification) %>%
+  distinct(MAG_ID, .keep_all = TRUE) %>%
+  separate(classification,
+    into = c("domain", "phylum", "class", "order", "family", "genus", "species"),
+    sep = ";"
+  ) %>%
+  mutate(across(everything(), ~ gsub("^[a-z]__", "", .))) %>%
+  mutate(species = ifelse(species == "" | is.na(species), "Unclassified", species))
+
+# Aggregate Read Counts to species level
+mag_count_long <- mag_count_mat %>%
+  rownames_to_column("Genome") %>%
+  pivot_longer(-Genome, names_to = "SampleID", values_to = "Count") %>%
+  left_join(mag_tax_parsed, by = c("Genome" = "MAG_ID"))
+
+mag_species_counts <- mag_count_long %>%
+  group_by(SampleID, species) %>%
+  summarise(Count = sum(Count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = species, values_from = Count, values_fill = 0) %>%
+  column_to_rownames("SampleID")
+
+# Align with metadata and filter
+common_samples <- intersect(rownames(mag_species_counts), rownames(metadata))
+mag_species_counts <- mag_species_counts[common_samples, , drop = FALSE]
+mag_species_counts_filt <- filter_features(mag_species_counts)
+
+cat("Samples:", nrow(mag_species_counts_filt), "\n")
+cat("Species:", ncol(mag_species_counts_filt), "\n")
+
+# --- RPKM, TPM, RPM, RPKG Calculations ---
+
+# 1. Load Genome Equivalents for RPKG/RPM
+ge_file <- file.path(DATA_DIR, "00_reads/Genome_Equivalents_Summary/ge_summary.csv")
+if (file.exists(ge_file)) {
+  ge_df <- fread(ge_file)
+  # Ensure SampleID column match
+  # Assuming colnames are SampleID, Genome_Equivalents, Read_Length, Total_Bases
+} else {
+  ge_df <- NULL
+  message("GE Summary not found. RPKG/RPM calculation limited.")
+}
+
+# 2. Extract MAG Lengths
+mag_lengths <- mag_stats %>%
+  select(MAG_ID, Total_bp) %>%
+  column_to_rownames("MAG_ID")
+# Ensure alignment with count matrix
+common_mags <- intersect(rownames(mag_count_mat), rownames(mag_lengths))
+mag_lengths <- mag_lengths[common_mags, , drop = FALSE]
+mag_count_mat_calc <- mag_count_mat[common_mags, , drop = FALSE]
+
+# 3. Calculate metrics
+
+# A. RPKM (Existing - from CoverM)
+rpkm_cols <- grep("RPKM", colnames(mag_counts_raw), value = TRUE)
+mag_rpkm_mat <- mag_counts_raw %>%
+  dplyr::select(Genome, all_of(rpkm_cols)) %>%
+  column_to_rownames("Genome")
+colnames(mag_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(mag_rpkm_mat))
+
+# B. TPM (From RPKM)
+mag_tpm_mat <- sweep(mag_rpkm_mat, 1, rowSums(mag_rpkm_mat), "/") * 1e6
+
+# C. RPM (Reads Per Million Sequenced Reads)
+# If GE data available, use Total_Bases/Read_Length as Total Reads?
+# Or just use Sum of Counts (Library Size)?
+# User usually implies "Reads Mean" -> Relative Abundance * 1e6.
+# But let's verify if they want "Reads Per Million Mapped" (RelAbund*1e6) or "Reads Per Million Sequenced".
+# Let's assume "Sequenced" if GE available, else "Mapped".
+
+mag_rpm_mat <- mag_count_mat_calc # Initialize
+if (!is.null(ge_df)) {
+  # Calculate Total Sequenced Reads per Sample
+  # Method robust to missing columns
+  cols_needed <- c("SampleID", "Total_Bases", "Read_Length")
+  if (all(cols_needed %in% colnames(ge_df))) {
+    ge_df$Total_Reads <- ge_df$Total_Bases / ge_df$Read_Length
+
+    # Align samples
+    common_samps_ge <- intersect(colnames(mag_rpm_mat), ge_df$SampleID)
+
+    for (s in common_samps_ge) {
+      tot_reads <- ge_df[SampleID == s, Total_Reads]
+      if (length(tot_reads) > 0 && tot_reads > 0) {
+        mag_rpm_mat[, s] <- (mag_count_mat_calc[, s] / tot_reads) * 1e6
+      } else {
+        mag_rpm_mat[, s] <- NA
+      }
+    }
+    cat("Calculated RPM using Total Sequenced Reads.\n")
+  } else {
+    # Fallback to Mapped RPM
+    mag_rpm_mat <- prop.table(as.matrix(mag_count_mat_calc), 2) * 1e6
+    cat("GE Columns missing. Calculated RPM using Mapped Reads (RelAbund * 1e6).\n")
+  }
+} else {
+  mag_rpm_mat <- prop.table(as.matrix(mag_count_mat_calc), 2) * 1e6
+  cat("GE file missing. Calculated RPM using Mapped Reads (RelAbund * 1e6).\n")
+}
+
+
+# D. RPKG (Reads Per Kilobase per Genome Equivalent)
+# RPKG = (Count / (Len/1000)) / GE
+mag_rpkg_mat <- mag_count_mat_calc # Init
+if (!is.null(ge_df) && "Genome_Equivalents" %in% colnames(ge_df)) {
+  # Calculate RPK first
+  mag_len_kb <- mag_lengths$Total_bp / 1000
+  mag_rpk_mat <- mag_count_mat_calc / mag_len_kb # Vector recycling? No, mag_len_kb is vector along rows.
+
+  # R expects division by vector to be along COLUMNS by default for matrix?
+  # Actually `mat / vec` divides each column by vec? No, it fills column major.
+  # use sweep for row-wise division
+  mag_rpk_mat <- sweep(mag_count_mat_calc, 1, mag_len_kb, "/")
+
+  # Now divide by GE (Sample-wise)
+  common_samps_ge <- intersect(colnames(mag_rpkg_mat), ge_df$SampleID)
+
+  for (s in common_samps_ge) {
+    ge_val <- ge_df[SampleID == s, Genome_Equivalents]
+    if (length(ge_val) > 0 && ge_val > 0) {
+      mag_rpkg_mat[, s] <- mag_rpk_mat[, s] / ge_val
+    } else {
+      mag_rpkg_mat[, s] <- NA
+    }
+  }
+  cat("Calculated RPKG.\n")
+} else {
+  mag_rpkg_mat[, ] <- NA
+  cat("Cannot calculate RPKG (GE missing).\n")
+}
+
+
+# --- Aggregation to Species Level ---
+
+# Define Helper for Aggregation
+agg_to_species <- function(mat, tax_df) {
+  if (all(is.na(mat))) {
+    return(NULL)
+  }
+
+  # Filter common genomes
+  comm <- intersect(rownames(mat), tax_df$MAG_ID)
+  mat_sub <- mat[comm, , drop = FALSE]
+  tax_sub <- tax_df %>% filter(MAG_ID %in% comm)
+
+  # Convert to Long
+  mat_long <- mat_sub %>%
+    as.data.frame() %>%
+    rownames_to_column("MAG_ID") %>%
+    pivot_longer(-MAG_ID, names_to = "SampleID", values_to = "Val") %>%
+    left_join(tax_sub, by = "MAG_ID")
+
+  # Aggregate
+  spec_mat <- mat_long %>%
+    group_by(SampleID, species) %>%
+    summarise(Val = sum(Val, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = species, values_from = Val, values_fill = 0) %>%
+    column_to_rownames("SampleID")
+
+  return(spec_mat)
+}
+
+# Aggregate all metrics
+mag_species_rpkm <- agg_to_species(mag_rpkm_mat, mag_tax_parsed)
+mag_species_tpm <- agg_to_species(mag_tpm_mat, mag_tax_parsed) # Note: Sum of TPMs is valid agg
+mag_species_rpm <- agg_to_species(mag_rpm_mat, mag_tax_parsed)
+mag_species_rpkg <- agg_to_species(mag_rpkg_mat, mag_tax_parsed)
+
+# Ensure dataframes and filtering (align with metadata)
+align_and_prep <- function(mat, meta) {
+  if (is.null(mat)) {
+    return(NULL)
+  }
+  comm <- intersect(rownames(mat), rownames(meta))
+  if (length(comm) == 0) {
+    return(NULL)
+  }
+  return(as.data.frame(mat[comm, , drop = FALSE]))
+}
+
+mag_species_rpkm <- align_and_prep(mag_species_rpkm, metadata)
+mag_species_tpm <- align_and_prep(mag_species_tpm, metadata)
+mag_species_rpm <- align_and_prep(mag_species_rpm, metadata)
+mag_species_rpkg <- align_and_prep(mag_species_rpkg, metadata)
+
+# Common samples aligned for Counts/Rel
+mag_species_counts <- mag_species_counts[common_samples, , drop = FALSE]
+mag_species_rel <- prop.table(as.matrix(mag_species_counts), 1) %>% as.data.frame()
+
+
+# Visualize MAG Composition (Species Level)
+cat("### Species Level: Relative Abundance\n")
+print(plot_composition_bar(mag_species_rel, metadata, metric_label = "Relative Abundance"))
+
+cat("### Species Level: Counts\n")
+print(plot_composition_bar(as.data.frame(mag_species_counts), metadata, metric_label = "Read Counts"))
+
+cat("### Species Level: RPKM\n")
+if (!is.null(mag_species_rpkm)) print(plot_composition_bar(mag_species_rpkm, metadata, metric_label = "RPKM"))
+
+cat("### Species Level: TPM\n")
+if (!is.null(mag_species_tpm)) print(plot_composition_bar(mag_species_tpm, metadata, metric_label = "TPM"))
+
+cat("### Species Level: RPM (Reads Per Million Sequenced)\n")
+if (!is.null(mag_species_rpm)) print(plot_composition_bar(mag_species_rpm, metadata, metric_label = "RPM"))
+
+cat("### Species Level: RPKG (Reads Per Kb per GE)\n")
+if (!is.null(mag_species_rpkg)) print(plot_composition_bar(mag_species_rpkg, metadata, metric_label = "RPKG"))
+```
+
+## Alpha Diversity
+
+
+```{r alpha_prokaryotes}
+hill_mag <- calc_hill(mag_species_counts_filt)
+hill_mag$Domain <- "Prokaryotes"
+hill_mag_meta <- left_join(hill_mag, metadata, by = "SampleID")
+
+# Generate Plot
+p_prok <- plot_hill_stats(hill_mag_meta, "Prokaryotes")
+print(p_prok)
+ggsave(file.path(OUT_DIR, "alpha_prokaryotes_boxplot.pdf"), p_prok, width = 10, height = 6)
+```
+
+## Kruskal-Wallis Tests
+
+```{r stats_prokaryotes}
+stats_mag <- hill_mag_meta %>%
+  pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+  group_by(q) %>%
+  summarise(p_value = kruskal.test(Value ~ Group4)$p.value, .groups = "drop")
+
+knitr::kable(stats_mag, caption = "Kruskal-Wallis: Prokaryotes Hill Numbers ~ Group4", digits = 4)
+```
+
+## Linear Model Analysis (Prokaryotes)
+
+```{r lm_prokaryotes, fig.width=12, fig.height=9}
+# Linear Model
+res_lm_prok <- analyze_and_plot_lm(hill_mag_meta, "Prokaryotes", model_type = "lm")
+print(res_lm_prok$main)
+ggsave(file.path(OUT_DIR, "alpha_prokaryotes_lm_main.pdf"), res_lm_prok$main, width = 12, height = 6)
+
+# Diagnostics
+print(res_lm_prok$diagnostics)
+ggsave(file.path(OUT_DIR, "alpha_prokaryotes_lm_diagnostics.pdf"), res_lm_prok$diagnostics, width = 12, height = 9)
+
+# Gamma GLM
+cat("\n### Gamma GLM Check (Prokaryotes)\n")
+res_gamma_prok <- analyze_and_plot_lm(hill_mag_meta, "Prokaryotes", model_type = "gamma")
+print(res_gamma_prok$main)
+ggsave(file.path(OUT_DIR, "alpha_prokaryotes_gamma_main.pdf"), res_gamma_prok$main, width = 12, height = 6)
+ggsave(file.path(DATA_DIR, "figures/supplementary/FigS4_alpha_gamma_mags.pdf"), res_gamma_prok$main, width = 12, height = 6)
+ggsave(file.path(OUT_DIR, "FigS4_alpha_gamma_mags.pdf"), res_gamma_prok$main, width = 12, height = 6)
+
+# Kruskal-Wallis
+cat("\n### Kruskal-Wallis Check (Prokaryotes)\n")
+res_kruskal_prok <- analyze_and_plot_lm(hill_mag_meta, "Prokaryotes", model_type = "kruskal")
+print(res_kruskal_prok$main)
+ggsave(file.path(OUT_DIR, "alpha_prokaryotes_kruskal_main.pdf"), res_kruskal_prok$main, width = 12, height = 6)
+```
+
+---
+
+# 2. Viruses
+
+## Composition (Viruses - Top vOTUs)
+
+```{r virus_composition, fig.width=12, fig.height=6}
+# Load RPKM data
+virus_cov_path <- file.path(DATA_DIR, "04_Viruses/coverage/coverm_results_viruses.tsv")
+if (file.exists(virus_cov_path)) {
+  virus_cov <- fread(virus_cov_path)
+
+  # Extract RPKM
+  rpkm_cols_v <- grep("RPKM", colnames(virus_cov), value = TRUE)
+  virus_rpkm_mat <- virus_cov %>%
+    dplyr::select(Contig, all_of(rpkm_cols_v)) %>%
+    column_to_rownames("Contig")
+  colnames(virus_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(virus_rpkm_mat))
+
+  # Calculate TPM
+  virus_tpm_mat <- sweep(virus_rpkm_mat, 1, rowSums(virus_rpkm_mat), "/") * 1e6
+
+  # Load Counts (already loaded in alpha section usually, but load here for plot)
+  virus_counts_path <- file.path(RESULTS_DIR, "data_objects", "virus_counts_filt.rds")
+  if (file.exists(virus_counts_path)) {
+    virus_counts_rds <- readRDS(virus_counts_path)
+
+    # Align samples
+    common_samples_v <- intersect(colnames(virus_rpkm_mat), colnames(virus_counts_rds))
+    comm_samp_meta <- intersect(common_samples_v, rownames(metadata))
+
+    if (length(comm_samp_meta) > 0) {
+      virus_rpkm_plot <- virus_rpkm_mat[, comm_samp_meta, drop = FALSE]
+      virus_tpm_plot <- virus_tpm_mat[, comm_samp_meta, drop = FALSE]
+      virus_counts_plot <- virus_counts_rds[, comm_samp_meta, drop = FALSE]
+
+      # Rename rows to vOTU_XXXX if needed?
+      # Assuming vOTU IDs are rows.
+
+      # Relative Abundance (from Counts)
+      virus_rel <- prop.table(as.matrix(virus_counts_plot), 2) %>% as.data.frame() # NOTE: prop.table margin=2 for columns=samples if input is features x samples
+      # Wait, my plot_composition_bar expects features as COLUMNS (wide format) or modifies inside?
+      # My plot_composition_bar expects: df_wide (rows=Samples, cols=Taxa)
+      # My matrices here are usually Features x Samples (from standard workflow).
+      # Let's check mag_species_counts.
+      # In `02_alpha_diversity.Rmd`:
+      # mag_species_counts was `column_to_rownames("SampleID")` -> So it is Samples x Species.
+      # CoverM output `virus_rpkm_mat` is Features x Samples.
+      # So I need to TRANSPOSE.
+
+      cat("### Top vOTUs: Relative Abundance\n")
+      print(plot_composition_bar(as.data.frame(t(virus_rel)), metadata, metric_label = "Relative Abundance", rank_col = "Taxon", n_top = 20))
+
+      cat("### Top vOTUs: Counts\n")
+      print(plot_composition_bar(as.data.frame(t(virus_counts_plot)), metadata, metric_label = "Counts", rank_col = "Taxon", n_top = 20))
+
+      cat("### Top vOTUs: RPKM\n")
+      print(plot_composition_bar(as.data.frame(t(virus_rpkm_plot)), metadata, metric_label = "RPKM", rank_col = "Taxon", n_top = 20))
+
+      cat("### Top vOTUs: TPM\n")
+      print(plot_composition_bar(as.data.frame(t(virus_tpm_plot)), metadata, metric_label = "TPM", rank_col = "Taxon", n_top = 20))
+    }
+  }
+} else {
+  message("Virus coverage file not found.")
+}
+```
+
+## Alpha Diversity
+
+```{r alpha_viruses}
+virus_counts <- readRDS(file.path(RESULTS_DIR, "data_objects", "virus_counts_filt.rds"))
+
+hill_virus <- calc_hill(virus_counts)
+hill_virus$Domain <- "Viruses"
+hill_virus_meta <- left_join(hill_virus, metadata, by = "SampleID")
+
+# Generate Plot
+p_virus <- plot_hill_stats(hill_virus_meta, "Viruses")
+print(p_virus)
+ggsave(file.path(OUT_DIR, "alpha_viruses_boxplot.pdf"), p_virus, width = 10, height = 6)
+```
+
+## Kruskal-Wallis Tests
+
+```{r stats_viruses}
+stats_virus <- hill_virus_meta %>%
+  pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+  group_by(q) %>%
+  summarise(p_value = kruskal.test(Value ~ Group4)$p.value, .groups = "drop")
+
+knitr::kable(stats_virus, caption = "Kruskal-Wallis: Viruses Hill Numbers ~ Group4", digits = 4)
+```
+
+## Linear Model Analysis (Viruses)
+
+```{r lm_viruses, fig.width=12, fig.height=9}
+# Linear Model
+res_lm_virus <- analyze_and_plot_lm(hill_virus_meta, "Viruses", model_type = "lm")
+print(res_lm_virus$main)
+ggsave(file.path(OUT_DIR, "alpha_viruses_lm_main.pdf"), res_lm_virus$main, width = 12, height = 6)
+
+# Diagnostics
+print(res_lm_virus$diagnostics)
+ggsave(file.path(OUT_DIR, "alpha_viruses_lm_diagnostics.pdf"), res_lm_virus$diagnostics, width = 12, height = 9)
+
+# Gamma GLM
+cat("\n### Gamma GLM Check (Viruses)\n")
+res_gamma_virus <- analyze_and_plot_lm(hill_virus_meta, "Viruses", model_type = "gamma")
+print(res_gamma_virus$main)
+ggsave(file.path(OUT_DIR, "alpha_viruses_gamma_main.pdf"), res_gamma_virus$main, width = 12, height = 6)
+ggsave(file.path(DATA_DIR, "figures/supplementary/FigS5_alpha_gamma_viruses.pdf"), res_gamma_virus$main, width = 12, height = 6)
+ggsave(file.path(OUT_DIR, "FigS5_alpha_gamma_viruses.pdf"), res_gamma_virus$main, width = 12, height = 6)
+
+# Kruskal-Wallis
+cat("\n### Kruskal-Wallis Check (Viruses)\n")
+res_kruskal_virus <- analyze_and_plot_lm(hill_virus_meta, "Viruses", model_type = "kruskal")
+print(res_kruskal_virus$main)
+ggsave(file.path(OUT_DIR, "alpha_viruses_kruskal_main.pdf"), res_kruskal_virus$main, width = 12, height = 6)
+```
+
+---
+
+# 3. Contigs (Genus Level)
+
+```{r alpha_contigs}
+contig_counts_path <- file.path(RESULTS_DIR, "data_objects", "contig_genus_counts_filt.rds")
+
+if (file.exists(contig_counts_path)) {
+  contig_counts <- readRDS(contig_counts_path)
+
+  hill_contig <- calc_hill(contig_counts)
+  hill_contig$Domain <- "Contigs"
+  hill_contig_meta <- left_join(hill_contig, metadata, by = "SampleID")
+
+  # Generate Plot
+  p_contig <- plot_hill_stats(hill_contig_meta, "Contigs (Genus Level)")
+  print(p_contig)
+  ggsave(file.path(OUT_DIR, "alpha_contigs_boxplot.pdf"), p_contig, width = 10, height = 6)
+} else {
+  message("Contig genus counts not found. Run 01_community_composition.Rmd first.")
+}
+```
+
+## Kruskal-Wallis Tests
+
+```{r stats_contigs}
+if (exists("hill_contig_meta")) {
+  stats_contig <- hill_contig_meta %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+    group_by(q) %>%
+    summarise(p_value = kruskal.test(Value ~ Group4)$p.value, .groups = "drop")
+
+  knitr::kable(stats_contig, caption = "Kruskal-Wallis: Contigs Hill Numbers ~ Group4", digits = 4)
+}
+```
+
+## Linear Model Analysis (Contigs)
+
+```{r lm_contigs, fig.width=12, fig.height=9}
+if (exists("hill_contig_meta")) {
+  # Linear Model
+  res_lm_contig <- analyze_and_plot_lm(hill_contig_meta, "Contigs", model_type = "lm")
+  print(res_lm_contig$main)
+  ggsave(file.path(OUT_DIR, "alpha_contigs_lm_main.pdf"), res_lm_contig$main, width = 12, height = 6)
+  print(res_lm_contig$diagnostics)
+  ggsave(file.path(OUT_DIR, "alpha_contigs_lm_diagnostics.pdf"), res_lm_contig$diagnostics, width = 12, height = 9)
+
+  # Gamma GLM
+  cat("\n### Gamma GLM Check (Contigs)\n")
+  res_gamma_contig <- analyze_and_plot_lm(hill_contig_meta, "Contigs", model_type = "gamma")
+  print(res_gamma_contig$main)
+  ggsave(file.path(OUT_DIR, "alpha_contigs_gamma_main.pdf"), res_gamma_contig$main, width = 12, height = 6)
+  ggsave(file.path(DATA_DIR, "figures/supplementary/FigS3_alpha_gamma_contigs.pdf"), res_gamma_contig$main, width = 12, height = 6)
+  ggsave(file.path(OUT_DIR, "FigS3_alpha_gamma_contigs.pdf"), res_gamma_contig$main, width = 12, height = 6)
+
+  # Kruskal-Wallis
+  cat("\n### Kruskal-Wallis Check (Contigs)\n")
+  res_kruskal_contig <- analyze_and_plot_lm(hill_contig_meta, "Contigs", model_type = "kruskal")
+  print(res_kruskal_contig$main)
+  ggsave(file.path(OUT_DIR, "alpha_contigs_kruskal_main.pdf"), res_kruskal_contig$main, width = 12, height = 6)
+} else {
+  message("Contigs data not available for LM analysis.")
+}
+```
+
+---
+
+# 4. Plasmids
+
+## Composition (Plasmids - Top Contigs)
+
+```{r plasmid_composition, fig.width=12, fig.height=6}
+# Load RPKM data
+plasmid_cov_path <- file.path(DATA_DIR, "03_Plasmids/coverage/coverm_results_plasmids.tsv")
+if (file.exists(plasmid_cov_path)) {
+  plasmid_cov <- fread(plasmid_cov_path)
+
+  # Extract RPKM
+  rpkm_cols_p <- grep("RPKM", colnames(plasmid_cov), value = TRUE)
+  plasmid_rpkm_mat <- plasmid_cov %>%
+    dplyr::select(Contig, all_of(rpkm_cols_p)) %>%
+    column_to_rownames("Contig")
+  colnames(plasmid_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(plasmid_rpkm_mat))
+
+  # Calculate TPM
+  plasmid_tpm_mat <- sweep(plasmid_rpkm_mat, 1, rowSums(plasmid_rpkm_mat), "/") * 1e6
+
+  # Extract Counts
+  count_cols_p <- grep("Read Count", colnames(plasmid_cov), value = TRUE)
+  plasmid_count_mat <- plasmid_cov %>%
+    dplyr::select(Contig, all_of(count_cols_p)) %>%
+    column_to_rownames("Contig")
+  colnames(plasmid_count_mat) <- gsub("\\.sorted Read Count", "", colnames(plasmid_count_mat))
+
+  # Align samples
+  common_samples_p <- intersect(colnames(plasmid_rpkm_mat), colnames(plasmid_count_mat))
+  comm_samp_meta_p <- intersect(common_samples_p, rownames(metadata))
+
+  if (length(comm_samp_meta_p) > 0) {
+    plasmid_rpkm_plot <- plasmid_rpkm_mat[, comm_samp_meta_p, drop = FALSE]
+    plasmid_tpm_plot <- plasmid_tpm_mat[, comm_samp_meta_p, drop = FALSE]
+    plasmid_counts_plot <- plasmid_count_mat[, comm_samp_meta_p, drop = FALSE]
+
+    # Relative Abundance (from Counts)
+    plasmid_rel <- prop.table(as.matrix(plasmid_counts_plot), 2) %>% as.data.frame()
+
+    cat("### Top Plasmid Contigs: Relative Abundance\n")
+    print(plot_composition_bar(as.data.frame(t(plasmid_rel)), metadata, metric_label = "Relative Abundance", rank_col = "Taxon", n_top = 20))
+
+    cat("### Top Plasmid Contigs: Counts\n")
+    print(plot_composition_bar(as.data.frame(t(plasmid_counts_plot)), metadata, metric_label = "Counts", rank_col = "Taxon", n_top = 20))
+
+    cat("### Top Plasmid Contigs: RPKM\n")
+    print(plot_composition_bar(as.data.frame(t(plasmid_rpkm_plot)), metadata, metric_label = "RPKM", rank_col = "Taxon", n_top = 20))
+
+    cat("### Top Plasmid Contigs: TPM\n")
+    print(plot_composition_bar(as.data.frame(t(plasmid_tpm_plot)), metadata, metric_label = "TPM", rank_col = "Taxon", n_top = 20))
+  }
+} else {
+  message("Plasmid coverage file not found.")
+}
+```
+
+## Alpha Diversity (Host Family Level)
+
+
+```{r alpha_plasmids}
+plasmid_counts_path <- file.path(RESULTS_DIR, "data_objects", "plasmid_family_counts_filt.rds")
+
+if (file.exists(plasmid_counts_path)) {
+  plasmid_counts <- readRDS(plasmid_counts_path)
+
+  hill_plasmid <- calc_hill(plasmid_counts)
+  hill_plasmid$Domain <- "Plasmids"
+  hill_plasmid_meta <- left_join(hill_plasmid, metadata, by = "SampleID")
+
+  # Generate Plot
+  p_plasmid <- plot_hill_stats(hill_plasmid_meta, "Plasmids (Host Family Level)")
+  print(p_plasmid)
+  ggsave(file.path(OUT_DIR, "alpha_plasmids_boxplot.pdf"), p_plasmid, width = 10, height = 6)
+} else {
+  message("Plasmid family counts not found. Run 05_genomic_context.Rmd first.")
+}
+```
+
+## Kruskal-Wallis Tests
+
+```{r stats_plasmids}
+if (exists("hill_plasmid_meta")) {
+  stats_plasmid <- hill_plasmid_meta %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+    group_by(q) %>%
+    summarise(p_value = kruskal.test(Value ~ Group4)$p.value, .groups = "drop")
+
+  knitr::kable(stats_plasmid, caption = "Kruskal-Wallis: Plasmids Hill Numbers ~ Group4", digits = 4)
+}
+```
+
+## Linear Model Analysis (Plasmids)
+
+```{r lm_plasmids, fig.width=12, fig.height=5}
+if (exists("hill_plasmid_meta")) {
+  p_lm_plasmid <- analyze_and_plot_lm(hill_plasmid_meta, "Plasmids")
+  print(p_lm_plasmid)
+  ggsave(file.path(OUT_DIR, "alpha_plasmids_lm_main.pdf"), p_lm_plasmid$main, width = 12, height = 6)
+} else {
+  message("Plasmids data not available for LM analysis.")
+}
+```
+
+---
+
+# Figure 2: Alpha diversity across genomic compartments
+
+This figure visualizes the loss of diversity resolution across genomic compartments, justifying the downstream focus on dominant taxa.
+
+```{r fig2_compartments, fig.width=10, fig.height=8}
+# Combine all domains
+all_hill <- bind_rows(
+  hill_reads_meta %>% dplyr::select(SampleID, Domain, Group4, q0, q1, q2),
+  hill_mag_meta %>% dplyr::select(SampleID, Domain, Group4, q0, q1, q2) %>%
+    dplyr::mutate(Domain = "MAGs (Species)"),
+  hill_virus_meta %>% dplyr::select(SampleID, Domain, Group4, q0, q1, q2)
+)
+
+# If these objects exist, also rename their Domain values consistently
+if (exists("hill_contig_meta")) {
+  all_hill <- bind_rows(
+    all_hill,
+    hill_contig_meta %>% dplyr::select(SampleID, Domain, Group4, q0, q1, q2)
+  )
+}
+
+if (exists("hill_plasmid_meta")) {
+  all_hill <- bind_rows(
+    all_hill,
+    hill_plasmid_meta %>% dplyr::select(SampleID, Domain, Group4, q0, q1, q2)
+  )
+}
+
+# Standardize Domain names (robust even if upstream Domain values differ)
+all_hill <- all_hill %>%
+  dplyr::mutate(
+    Domain = dplyr::case_when(
+      Domain %in% c("Reads", "Reads (Genus)", "Read-based", "Read-based (Genus)") ~ "Reads (Genus)",
+      Domain %in% c("Contigs", "Contigs (Genus)", "Contig-based", "Contig-based (Genus)") ~ "Contigs (Genus)",
+      Domain %in% c("Prokaryotes", "Prokaryotes (Species)", "MAGs", "MAGs (Species)") ~ "MAGs (Species)",
+      Domain %in% c("Plasmids", "Plasmids (pOTU)", "pOTU") ~ "Plasmids (pOTU)",
+      Domain %in% c("Viruses", "Viruses (vOTU)", "vOTU") ~ "Viruses (vOTU)",
+      TRUE ~ as.character(Domain)
+    )
+  )
+
+# Pivot to long format
+all_hill_long <- all_hill %>%
+  pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value")
+
+# Set factor levels for proper ordering
+domain_levels <- c(
+  "Reads (Genus)",
+  "Contigs (Genus)",
+  "MAGs (Species)",
+  "Plasmids (pOTU)",
+  "Viruses (vOTU)"
+)
+all_hill_long$Domain <- factor(all_hill_long$Domain, levels = domain_levels)
+
+# Nice facet labels
+q_labs <- c(
+  "q0" = "Richness (q=0)",
+  "q1" = "Shannon (q=1)",
+  "q2" = "Simpson (q=2)"
+)
+all_hill_long$q_label <- factor(
+  all_hill_long$q,
+  levels = c("q0", "q1", "q2"),
+  labels = q_labs
+)
+
+# Create Figure 2 - Grid Layout
+p_fig2 <- ggplot(all_hill_long, aes(x = Group4, y = Value, fill = Group4)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+  facet_wrap(Domain ~ q_label, scales = "free_y", ncol = 3) +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = group4_colors) +
+  labs(
+    title = "Alpha Diversity Across Genomic Compartments",
+    subtitle = "Each panel has independent Y-axis scale",
+    y = "Hill Number",
+    x = ""
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "grey95"),
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7)
+  )
+
+print(p_fig2)
+ggsave(file.path(DATA_DIR, "figures/main/Fig2_alpha_compartments.pdf"), p_fig2, width = 12, height = 16)
+ggsave(file.path(OUT_DIR, "Fig2_alpha_compartments.pdf"), p_fig2, width = 12, height = 16)
+```
+
+---
+
+# Figure 3: Concordance Analysis
+
+This figure establishes which diversity signals are preserved across resolutions using correlation analysis.
+
+```{r fig3_concordance, fig.width=10, fig.height=10}
+library(ggpubr)
+
+# Helper to prep data pairs
+prep_pair <- function(df1, df2, name1, name2) {
+  inner_join(
+    df1 %>% dplyr::select(SampleID, Group4, q0, q1, q2),
+    df2 %>% dplyr::select(SampleID, q0, q1, q2),
+    by = "SampleID", suffix = c(paste0("_", name1), paste0("_", name2))
+  )
+}
+
+plot_list <- list()
+
+# Panel A: Reads vs Contigs (q0)
+if (exists("hill_contig_meta")) {
+  df_rc <- prep_pair(hill_reads_meta, hill_contig_meta, "Reads", "Contigs")
+
+  p1 <- ggplot(df_rc, aes(x = q0_Reads, y = q0_Contigs)) +
+    geom_point(aes(color = Group4), size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", color = "black", se = TRUE, linetype = "dashed") +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", size = 4) +
+    scale_color_manual(values = group4_colors) +
+    labs(title = "Reads vs Contigs (q0)", x = "Reads Richness", y = "Contigs Richness") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none")
+
+  plot_list[[length(plot_list) + 1]] <- p1
+
+  # Panel B: Reads vs Contigs (q1)
+  p2 <- ggplot(df_rc, aes(x = q1_Reads, y = q1_Contigs)) +
+    geom_point(aes(color = Group4), size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", color = "black", se = TRUE, linetype = "dashed") +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", size = 4) +
+    scale_color_manual(values = group4_colors) +
+    labs(title = "Reads vs Contigs (q1)", x = "Reads Shannon", y = "Contigs Shannon") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none")
+
+  plot_list[[length(plot_list) + 1]] <- p2
+}
+
+# Panel C: Reads vs MAGs (q1)
+df_rm <- prep_pair(hill_reads_meta, hill_mag_meta, "Reads", "MAGs")
+p3 <- ggplot(df_rm, aes(x = q1_Reads, y = q1_MAGs)) +
+  geom_point(aes(color = Group4), size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "black", se = TRUE, linetype = "dashed") +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", size = 4) +
+  scale_color_manual(values = group4_colors) +
+  labs(title = "Reads vs Prokaryotes (q1)", x = "Reads Shannon", y = "Prokaryotes Shannon") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+plot_list[[length(plot_list) + 1]] <- p3
+
+# Panel D: Reads vs MAGs (q2)
+p4 <- ggplot(df_rm, aes(x = q2_Reads, y = q2_MAGs)) +
+  geom_point(aes(color = Group4), size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "black", se = TRUE, linetype = "dashed") +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", size = 4) +
+  scale_color_manual(values = group4_colors) +
+  labs(title = "Reads vs Prokaryotes (q2)", x = "Reads Simpson", y = "Prokaryotes Simpson") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+
+plot_list[[length(plot_list) + 1]] <- p4
+
+# Arrange Grid
+p_fig3 <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+p_fig3 <- annotate_figure(p_fig3, top = text_grob("Concordance of Alpha Diversity Signals", face = "bold", size = 16))
+
+print(p_fig3)
+ggsave(file.path(DATA_DIR, "figures/main/Fig3_alpha_concordance.pdf"), p_fig3, width = 10, height = 10)
+```
+
+# 5. Contig Alpha Diversity Normalization Comparison
+
+This section evaluates how different normalization methods affect alpha diversity estimates for Contigs. We compare:
+1. **Raw Counts**: Original read counts (sensitive to sequencing depth).
+2. **Rarefied Counts**: Subsampled to the minimum library size (standardizes depth, but discards data).
+3. **RPKM**: Reads Per Kilobase Million (normalizes for gene length and library size).
+4. **Relative Abundance**: Proportion of reads (sum-normalized composition).
+
+```{r contig_norm_comparison, fig.width=10, fig.height=10}
+# 1. Load Data for All Methods
+# Re-scan for contig files to ensure we get all metric columns
+contigs_dir <- file.path(DATA_DIR, "01_contigs/coverage/mapping_metaspades")
+file_path_pattern <- "coverm_contigs\\.1000\\.tsv$"
+all_files <- list.files(contigs_dir, recursive = TRUE, full.names = TRUE, pattern = file_path_pattern)
+
+if (length(all_files) > 0) {
+  read_coverm_metrics <- function(f) {
+    dt <- tryCatch(fread(f), error = function(e) NULL)
+    if (is.null(dt)) {
+      return(NULL)
+    }
+
+    # Identify Columns
+    id_col <- colnames(dt)[1] # Contig ID
+    count_col <- grep("Read Count", colnames(dt), value = TRUE, ignore.case = TRUE)
+    rpkm_col <- grep("RPKM", colnames(dt), value = TRUE, ignore.case = TRUE)
+    # TPM is the available relative abundance metric
+    tpm_col <- grep("TPM", colnames(dt), value = TRUE, ignore.case = TRUE)
+
+    # We need Counts for Rarefaction and RPKM/TPM for comparison
+    if (length(count_col) == 0 || length(rpkm_col) == 0 || length(tpm_col) == 0) {
+      return(NULL)
+    }
+
+    # Extract
+    dt_sub <- dt[, c(id_col, count_col, rpkm_col, tpm_col), with = FALSE]
+    setnames(dt_sub, c("Contig", "Count", "RPKM", "TPM"))
+
+    # Parse SampleID
+    folder_name <- basename(dirname(f))
+    clean_sample <- gsub("_contigs\\.1000.*", "", folder_name)
+    dt_sub$SampleID <- clean_sample
+
+    return(dt_sub)
+  }
+
+  # Load and Combine
+  metrics_list <- lapply(all_files, read_coverm_metrics)
+  metrics_list <- Filter(Negate(is.null), metrics_list)
+  all_metrics <- rbindlist(metrics_list)
+
+  # Filter to Metadata Samples
+  all_metrics <- all_metrics[SampleID %in% rownames(metadata)]
+
+  # 2. Reshape into Matrices (Sample x Contig)
+  # Raw Counts
+  mat_count <- all_metrics %>%
+    dplyr::select(SampleID, Contig, Count) %>%
+    pivot_wider(names_from = Contig, values_from = Count, values_fill = 0) %>%
+    column_to_rownames("SampleID")
+
+  # RPKM
+  mat_rpkm <- all_metrics %>%
+    dplyr::select(SampleID, Contig, RPKM) %>%
+    pivot_wider(names_from = Contig, values_from = RPKM, values_fill = 0) %>%
+    column_to_rownames("SampleID")
+
+  # TPM (Relative Abundance)
+  mat_tpm <- all_metrics %>%
+    dplyr::select(SampleID, Contig, TPM) %>%
+    pivot_wider(names_from = Contig, values_from = TPM, values_fill = 0) %>%
+    column_to_rownames("SampleID")
+
+  # Rarefied Counts
+  min_depth_c <- min(rowSums(mat_count))
+  # Only rarefy if depth vary
+  if (sd(rowSums(mat_count)) > 0) {
+    mat_rarefied <- vegan::rrarefy(mat_count, sample = min_depth_c)
+  } else {
+    mat_rarefied <- as.matrix(mat_count)
+  }
+
+  # 3. Calculate Hill Numbers for Each Method
+  calc_hill_norm <- function(mat, method_name) {
+    # Ensure matrix format
+    mat <- as.matrix(mat)
+
+    res <- tryCatch(
+      {
+        calc_hill(mat)
+      },
+      error = function(e) {
+        # Fallback if calc_hill fails (e.g. NAs)
+        return(NULL)
+      }
+    )
+
+    if (!is.null(res)) {
+      res$Normalization <- method_name
+    }
+    return(res)
+  }
+
+  hill_raw <- calc_hill_norm(mat_count, "Raw Counts")
+  hill_rare <- calc_hill_norm(mat_rarefied, paste0("Rarefied (", format(min_depth_c, big.mark = ","), ")"))
+  hill_rpkm <- calc_hill_norm(mat_rpkm, "RPKM")
+  hill_tpm <- calc_hill_norm(mat_tpm, "TPM (Relative Abundance)")
+
+  # Combine
+  hill_compare <- bind_rows(hill_raw, hill_rare, hill_rpkm, hill_tpm)
+
+  if (nrow(hill_compare) > 0) {
+    # Add Metadata - Handle SampleID column safely
+    meta_for_join <- metadata
+    if (!"SampleID" %in% colnames(meta_for_join)) {
+      meta_for_join$SampleID <- rownames(meta_for_join)
+    }
+
+    hill_compare <- left_join(hill_compare, meta_for_join, by = "SampleID")
+
+    # Reshape for Plotting
+    hill_compare_long <- hill_compare %>%
+      pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value") %>%
+      mutate(q_label = factor(q, levels = c("q0", "q1", "q2"), labels = c("Richness (q0)", "Shannon (q1)", "Simpson (q2)")))
+
+    # 4. Plot Comparison
+    p_norm_compare <- ggplot(hill_compare_long, aes(x = Normalization, y = Value, fill = Normalization)) +
+      geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+      geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+      facet_wrap(~q_label, scales = "free_y", ncol = 1) +
+      theme_bw(base_size = 12) +
+      labs(
+        title = "Contig Alpha Diversity: Normalization Comparison",
+        subtitle = "Comparing Raw, Rarefied, RPKM, and Relative Abundance",
+        y = "Hill Number",
+        x = "Normalization Method"
+      ) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      )
+
+
+    print(p_norm_compare)
+    ggsave(file.path(DATA_DIR, "figures/supplementary/FigS_contig_normalization.pdf"), p_norm_compare, width = 10, height = 10)
+    ggsave(file.path(OUT_DIR, "FigS_contig_normalization.pdf"), p_norm_compare, width = 10, height = 10)
+  }
+} else {
+  print("No contig coverage files found for normalization comparison.")
+}
+```
+
+# 6. Compositional Stability (Stacked Bar Plots)
+
+This section visualizes how normalization affects the taxonomic composition at specific ranks:
+- **Reads**: Phylum (Raw vs Rarefied)
+- **Contigs**: Genus (Raw, Rarefied, RPKM, TPM)
+- **Prokaryotes (MAGs)**: Species (Raw, Rarefied, RPKM)
+
+```{r composition_grid_plot, fig.width=16, fig.height=12}
+# Helper Function for Composition Plot
+plot_comp_bar <- function(df_long, title, n_top = 15) {
+  # df_long must have columns: SampleID, Taxon, Value (Relative Abundance)
+
+  # Identify Top Taxa
+  top_taxa <- df_long %>%
+    group_by(Taxon) %>%
+    summarise(MeanVal = mean(Value, na.rm = TRUE)) %>%
+    top_n(n_top, MeanVal) %>%
+    pull(Taxon)
+
+  # Group Other
+  df_plot <- df_long %>%
+    mutate(DisplayTaxon = ifelse(Taxon %in% top_taxa, Taxon, "Other")) %>%
+    group_by(SampleID, DisplayTaxon) %>%
+    summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+
+  # Order Taxa (Other last)
+  df_plot$DisplayTaxon <- factor(df_plot$DisplayTaxon, levels = c(top_taxa, "Other"))
+
+  # Add Metadata
+  # Ensure SampleID matches
+  meta_for_join <- metadata
+  if (!"SampleID" %in% colnames(meta_for_join)) {
+    meta_for_join$SampleID <- rownames(meta_for_join)
+  }
+  df_plot <- left_join(df_plot, meta_for_join, by = "SampleID")
+
+  if (nrow(df_plot) == 0) {
+    warning(paste("Plot", title, "has no data after join."))
+    return(NULL)
+  }
+
+  # Palette
+  n_colors <- length(top_taxa)
+  # Use a distinct palette
+  my_palette <- c(RColorBrewer::brewer.pal(min(n_colors, 12), "Paired"), RColorBrewer::brewer.pal(max(0, n_colors - 12), "Set3"))[1:n_colors]
+  names(my_palette) <- top_taxa
+  final_palette <- c(my_palette, "Other" = "grey85")
+
+  # Plot
+  p <- ggplot(df_plot, aes(x = SampleID, y = Value, fill = DisplayTaxon)) +
+    geom_bar(stat = "identity", width = 0.9) +
+    facet_grid(~Group4, scales = "free_x", space = "free") +
+    scale_fill_manual(values = final_palette) +
+    theme_bw(base_size = 10) +
+    labs(title = title, y = "Relative Abundance", x = "", fill = "Taxon") +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+      legend.position = "right",
+      legend.key.size = unit(0.4, "cm")
+    )
+  return(p)
+}
+
+plot_list_comp <- list()
+
+### 1. Reads (Phylum) ###
+if (exists("read_data_clean") && nrow(read_data_clean) > 0) {
+  # Raw
+  reads_raw_phy <- read_data_clean %>%
+    group_by(sample, phylum) %>%
+    summarise(Count = sum(count), .groups = "drop") %>%
+    group_by(sample) %>%
+    mutate(Value = Count / sum(Count)) %>%
+    rename(SampleID = sample, Taxon = phylum)
+
+  # Rarefied
+  # Map Genus -> Phylum
+  genus_phylum_map <- read_data_clean %>%
+    select(genus, phylum) %>%
+    distinct() %>%
+    filter(genus != "" & !is.na(genus))
+
+  if (exists("read_rarefied")) {
+    # Rarefied Matrix (Sample x Genus)
+    read_rare_long <- as.data.frame(as.matrix(read_rarefied)) %>%
+      rownames_to_column("SampleID") %>%
+      pivot_longer(-SampleID, names_to = "genus", values_to = "Count") %>%
+      left_join(genus_phylum_map, by = "genus") %>%
+      filter(!is.na(phylum)) %>%
+      group_by(SampleID, phylum) %>%
+      summarise(Count = sum(Count), .groups = "drop") %>%
+      group_by(SampleID) %>%
+      mutate(Value = Count / sum(Count)) %>%
+      rename(Taxon = phylum)
+
+    plot_list_comp[["Reads_Rarefied"]] <- plot_comp_bar(read_rare_long, "Reads (Phylum) - Rarefied")
+  }
+
+  plot_list_comp[["Reads_Raw"]] <- plot_comp_bar(reads_raw_phy, "Reads (Phylum) - Raw")
+}
+
+### 2. Contigs (Phylum) ###
+# Load Contig Taxonomy
+# Pattern: "01_contigs/Taxonomy/*_combined.tsv"
+contig_tax_files <- list.files(file.path(DATA_DIR, "01_contigs/Taxonomy"), pattern = "_combined\\.tsv$", full.names = TRUE)
+if (length(contig_tax_files) > 0) {
+  contig_tax <- rbindlist(lapply(contig_tax_files, fread), fill = TRUE)
+  # Keep ID and Phylum
+  if ("phylum" %in% colnames(contig_tax)) {
+    contig_tax_map <- contig_tax[, .(contig_id, phylum, sample)]
+
+    if (exists("all_metrics")) {
+      # Join with tax
+      contig_data <- left_join(all_metrics, contig_tax_map %>% select(contig_id, phylum) %>% distinct(), by = c("Contig" = "contig_id"))
+
+      # Check if we have Phylum
+      if (sum(!is.na(contig_data$phylum)) > 0) {
+        process_contig_method <- function(col_name, title) {
+          contig_data %>%
+            filter(!is.na(phylum) & phylum != "") %>%
+            group_by(SampleID, phylum) %>%
+            summarise(Abundance = sum(.data[[col_name]]), .groups = "drop") %>%
+            group_by(SampleID) %>%
+            mutate(Value = Abundance / sum(Abundance)) %>%
+            rename(Taxon = phylum) %>%
+            plot_comp_bar(title)
+        }
+
+        plot_list_comp[["Contigs_Raw"]] <- process_contig_method("Count", "Contigs (Phylum) - Raw")
+        plot_list_comp[["Contigs_RPKM"]] <- process_contig_method("RPKM", "Contigs (Phylum) - RPKM")
+        plot_list_comp[["Contigs_TPM"]] <- process_contig_method("TPM", "Contigs (Phylum) - TPM")
+
+        # Rarefied Contigs
+        if (exists("mat_rarefied")) {
+          contig_rare_long <- as.data.frame(as.matrix(mat_rarefied)) %>%
+            rownames_to_column("SampleID") %>%
+            pivot_longer(-SampleID, names_to = "Contig", values_to = "Count") %>%
+            left_join(contig_tax_map %>% select(contig_id, phylum) %>% distinct(), by = c("Contig" = "contig_id")) %>%
+            filter(!is.na(phylum) & phylum != "") %>%
+            group_by(SampleID, phylum) %>%
+            summarise(Count = sum(Count), .groups = "drop") %>%
+            group_by(SampleID) %>%
+            mutate(Value = Count / sum(Count)) %>%
+            rename(Taxon = phylum)
+
+          plot_list_comp[["Contigs_Rarefied"]] <- plot_comp_bar(contig_rare_long, "Contigs (Phylum) - Rarefied")
+        }
+      }
+    }
+  }
+}
+
+### 3. MAGs (Phylum) ###
+# Using 'mag_count_mat' (Raw) and 'mag_stats' (Taxonomy)
+if (exists("mag_count_mat") && exists("mag_stats")) {
+  # Parse MAG Taxonomy (Phylum)
+  if (!"Phylum" %in% colnames(mag_stats)) {
+    if ("classification" %in% colnames(mag_stats)) {
+      mag_stats[, Phylum := gsub(".*p__", "", classification)]
+      mag_stats[, Phylum := gsub(";.*", "", Phylum)]
+      # Handle cases where p__ is missing (e.g. Unclassified)
+      # If no p__, it might retain whole string or be empty. check.
+    } else {
+      message("MAG Stats missing classification/Phylum column.")
+      mag_stats$Phylum <- "Unknown"
+    }
+  }
+
+  # Map MAG -> Phylum
+  # Ensure column names match (MAG_ID vs Genome)
+  id_col <- "MAG_ID"
+  if (!id_col %in% colnames(mag_stats)) id_col <- "Genome"
+
+  if (id_col %in% colnames(mag_stats)) {
+    mag_tax_map <- mag_stats %>%
+      select(all_of(id_col), Phylum) %>%
+      rename(Genome = all_of(id_col)) %>%
+      distinct()
+
+    # Raw
+    mag_raw_long <- as.data.frame(as.matrix(mag_count_mat)) %>%
+      rownames_to_column("Genome") %>%
+      pivot_longer(-Genome, names_to = "SampleID", values_to = "Count") %>%
+      left_join(mag_tax_map, by = "Genome") %>%
+      filter(!is.na(Phylum)) %>%
+      group_by(SampleID, Phylum) %>%
+      summarise(Count = sum(Count), .groups = "drop") %>%
+      group_by(SampleID) %>%
+      mutate(Value = Count / sum(Count)) %>%
+      rename(Taxon = Phylum)
+
+    plot_list_comp[["MAGs_Raw"]] <- plot_comp_bar(mag_raw_long, "MAGs (Phylum) - Raw")
+
+    # RPKM logic
+    if (exists("mag_counts_raw")) {
+      rpkm_cols <- grep("RPKM", colnames(mag_counts_raw), value = TRUE)
+      if (length(rpkm_cols) > 0) {
+        # SampleID.sorted RPKM
+        mag_rpkm_df <- mag_counts_raw %>% select(Genome, all_of(rpkm_cols))
+
+        mag_rpkm_long_raw <- mag_rpkm_df %>%
+          pivot_longer(cols = -Genome, names_to = "SampleCol", values_to = "RPKM") %>%
+          mutate(SampleID = gsub("\\.sorted RPKM", "", SampleCol)) %>%
+          select(-SampleCol)
+
+        mag_rpkm_agg <- mag_rpkm_long_raw %>%
+          left_join(mag_tax_map, by = "Genome") %>%
+          filter(!is.na(Phylum)) %>%
+          group_by(SampleID, Phylum) %>%
+          summarise(Val = sum(RPKM), .groups = "drop") %>%
+          group_by(SampleID) %>%
+          mutate(Value = Val / sum(Val)) %>%
+          rename(Taxon = Phylum)
+
+        plot_list_comp[["MAGs_RPKM"]] <- plot_comp_bar(mag_rpkm_agg, "MAGs (Phylum) - RPKM")
+      }
+    }
+  }
+}
+
+# Combine Plots
+if (length(plot_list_comp) > 0) {
+  # Filter out NULLs
+  plot_list_comp <- Filter(function(x) !is.null(x), plot_list_comp)
+
+  # Arrange
+  p_comp_grid <- ggarrange(plotlist = plot_list_comp, ncol = 2, nrow = ceiling(length(plot_list_comp) / 2), common.legend = FALSE)
+
+  print(p_comp_grid)
+
+  ggsave(file.path(DATA_DIR, "figures/supplementary/FigS_normalization_composition.pdf"), p_comp_grid, width = 20, height = 24, limitsize = FALSE)
+  ggsave(file.path(OUT_DIR, "FigS_normalization_composition.pdf"), p_comp_grid, width = 20, height = 24, limitsize = FALSE)
+
+  # Save individual plots as requested
+  for (plot_name in names(plot_list_comp)) {
+    p <- plot_list_comp[[plot_name]]
+    safe_name <- gsub(" ", "_", plot_name)
+    # Remove parens etc from filename
+    safe_name <- gsub("[()]", "", safe_name)
+    fname <- paste0("FigS_comp_", safe_name, ".pdf")
+    ggsave(file.path(OUT_DIR, fname), p, width = 10, height = 6)
+  }
+}
+
+### Summary Composition Plots (Raw, Multiple Taxonomic Levels)
+
+
+# ===================================================================
+# Summary Composition Plots: Loop over Phylum, Class, Order, Family, Genus
+# For each level: produce Vertical + Interleaved plots
+# ===================================================================
+
+# Load contig taxonomy ONCE (all columns)
+if (!exists("contig_tax_full")) {
+  contig_tax_files <- list.files(file.path(DATA_DIR, "01_contigs/Taxonomy"), pattern = "_combined\\.tsv$", full.names = TRUE)
+  if (length(contig_tax_files) > 0) {
+    contig_tax_full <- rbindlist(lapply(contig_tax_files, fread), fill = TRUE)
+  }
+}
+
+tax_levels <- c("phylum", "class", "order", "family", "genus")
+
+for (tax_level in tax_levels) {
+  cat(paste0("\n\n#### ", tools::toTitleCase(tax_level), " Level\n\n"))
+
+  plot_list_summary <- list()
+  summary_data_list <- list()
+
+  # --- 1. Reads ---
+  if (exists("read_data_clean") && nrow(read_data_clean) > 0 && tax_level %in% colnames(read_data_clean)) {
+    reads_tmp <- read_data_clean
+    reads_tmp$Taxon <- reads_tmp[[tax_level]]
+    reads_agg <- reads_tmp %>%
+      filter(!is.na(Taxon) & Taxon != "") %>%
+      group_by(sample, Taxon) %>%
+      summarise(Count = sum(count), .groups = "drop") %>%
+      group_by(sample) %>%
+      mutate(Value = Count / sum(Count)) %>%
+      rename(SampleID = sample)
+
+    plot_list_summary[["Reads"]] <- plot_comp_bar(reads_agg, "Reads")
+    summary_data_list[["Reads"]] <- reads_agg %>% mutate(Domain = "Reads")
+  }
+
+  # --- 2. Contigs ---
+  if (exists("all_metrics") && exists("contig_tax_full") && tax_level %in% colnames(contig_tax_full)) {
+    contig_tax_sub <- contig_tax_full[, c("contig_id", tax_level), with = FALSE]
+    colnames(contig_tax_sub)[2] <- "Taxon"
+    contig_tax_sub <- unique(contig_tax_sub)
+    contig_data_joined <- merge(all_metrics, contig_tax_sub, by.x = "Contig", by.y = "contig_id", all.x = TRUE)
+
+    if (sum(!is.na(contig_data_joined$Taxon)) > 0) {
+      contig_agg <- contig_data_joined %>%
+        filter(!is.na(Taxon) & Taxon != "") %>%
+        group_by(SampleID, Taxon) %>%
+        summarise(Abundance = sum(Count), .groups = "drop") %>%
+        group_by(SampleID) %>%
+        mutate(Value = Abundance / sum(Abundance))
+
+      plot_list_summary[["Contigs"]] <- plot_comp_bar(contig_agg, "Contigs")
+      summary_data_list[["Contigs"]] <- contig_agg %>% mutate(Domain = "Contigs")
+    }
+  }
+
+  # --- 3. MAGs ---
+  if (exists("mag_count_mat") && exists("mag_tax_parsed")) {
+    if (tax_level %in% colnames(mag_tax_parsed)) {
+      mag_tax_sub <- mag_tax_parsed[, c("MAG_ID", tax_level)]
+      colnames(mag_tax_sub)[2] <- "Taxon"
+      mag_tax_sub <- mag_tax_sub[!is.na(mag_tax_sub$Taxon) & mag_tax_sub$Taxon != "" & mag_tax_sub$Taxon != "Unclassified", ]
+      mag_tax_sub <- unique(mag_tax_sub)
+
+      mag_agg <- as.data.frame(as.matrix(mag_count_mat)) %>%
+        rownames_to_column("Genome") %>%
+        pivot_longer(-Genome, names_to = "SampleID", values_to = "Count") %>%
+        merge(mag_tax_sub, by.x = "Genome", by.y = "MAG_ID", all.x = FALSE) %>%
+        filter(!is.na(Taxon)) %>%
+        group_by(SampleID, Taxon) %>%
+        summarise(Count = sum(Count), .groups = "drop") %>%
+        group_by(SampleID) %>%
+        mutate(Value = Count / sum(Count))
+
+      plot_list_summary[["MAGs"]] <- plot_comp_bar(mag_agg, "MAGs")
+      summary_data_list[["MAGs"]] <- mag_agg %>% mutate(Domain = "MAGs")
+    }
+  }
+
+  # --- Produce Plots ---
+  if (length(plot_list_summary) > 0) {
+    preferred_order <- c("Reads", "Contigs", "MAGs")
+    plot_list_ordered <- plot_list_summary[intersect(preferred_order, names(plot_list_summary))]
+    level_title <- tools::toTitleCase(tax_level)
+
+    # A. Vertical Plot
+    if (length(plot_list_ordered) > 0) {
+      p_vertical <- ggarrange(plotlist = plot_list_ordered, ncol = 1, nrow = length(plot_list_ordered), common.legend = FALSE, align = "v")
+      print(p_vertical)
+      ggsave(file.path(OUT_DIR, paste0("FigS_summary_composition_vertical_", tax_level, ".pdf")), p_vertical, width = 12, height = 15)
+    }
+
+    # B. Interleaved Plot
+    if (length(summary_data_list) > 0) {
+      df_combined <- bind_rows(summary_data_list)
+      df_combined$Domain <- factor(df_combined$Domain, levels = preferred_order)
+
+      meta_sub <- metadata
+      if (!"SampleID" %in% colnames(meta_sub)) meta_sub$SampleID <- rownames(meta_sub)
+      df_interleaved <- left_join(df_combined, meta_sub, by = "SampleID")
+
+      top_taxa_all <- df_interleaved %>%
+        group_by(Taxon) %>%
+        summarise(MeanVal = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+        slice_max(MeanVal, n = 18) %>%
+        pull(Taxon)
+
+      df_interleaved <- df_interleaved %>%
+        mutate(DisplayTaxon = ifelse(Taxon %in% top_taxa_all, Taxon, "Other"))
+      df_interleaved$DisplayTaxon <- factor(df_interleaved$DisplayTaxon, levels = c(top_taxa_all, "Other"))
+
+      n_cols <- length(top_taxa_all)
+      if (n_cols >= 3) {
+        pal_base <- RColorBrewer::brewer.pal(min(n_cols, 12), "Paired")
+        if (n_cols > 12) pal_base <- c(pal_base, RColorBrewer::brewer.pal(min(n_cols - 12, 12), "Set3"))
+        if (n_cols > 24) pal_base <- c(pal_base, RColorBrewer::brewer.pal(min(n_cols - 24, 8), "Dark2"))
+        my_pal <- pal_base[1:n_cols]
+      } else {
+        my_pal <- RColorBrewer::brewer.pal(3, "Paired")[1:n_cols]
+      }
+      names(my_pal) <- top_taxa_all
+      final_pal <- c(my_pal, "Other" = "grey90")
+
+      df_interleaved <- df_interleaved %>%
+        arrange(Group4, SampleID, Domain) %>%
+        mutate(UniqueBarID = paste(SampleID, Domain, sep = "_"))
+      unique_ids <- unique(df_interleaved$UniqueBarID)
+      df_interleaved$UniqueBarID <- factor(df_interleaved$UniqueBarID, levels = unique_ids)
+
+      p_interleaved <- ggplot(df_interleaved, aes(x = UniqueBarID, y = Value, fill = DisplayTaxon)) +
+        geom_bar(stat = "identity", width = 1) +
+        facet_grid(~Group4, scales = "free_x", space = "free") +
+        scale_fill_manual(values = final_pal) +
+        theme_bw() +
+        labs(
+          title = paste0("Composition (", level_title, ") - Interleaved"),
+          x = "Sample (Reads | Contigs | MAGs)", y = "Relative Abundance"
+        ) +
+        theme(
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          panel.grid.major.x = element_blank()
+        )
+
+      print(p_interleaved)
+      ggsave(file.path(OUT_DIR, paste0("FigS_summary_composition_interleaved_", tax_level, ".pdf")), p_interleaved, width = 16, height = 8)
+    }
+  }
+}
+```
+
+### Unified-Color Genus Composition (Vertical)
+
+```{r unified_genus_composition, fig.width=16, fig.height=18}
+# ===================================================================
+# Genus-Level Composition: Same taxa = Same color across compartments
+# X-axis labels on bottom only, Domain labels on the right, 45° angle
+# ===================================================================
+
+genus_data_list <- list()
+
+# 1. Reads
+if (exists("read_data_clean") && nrow(read_data_clean) > 0 && "genus" %in% colnames(read_data_clean)) {
+  genus_data_list[["Reads"]] <- read_data_clean %>%
+    filter(!is.na(genus) & genus != "") %>%
+    group_by(sample, genus) %>%
+    summarise(Count = sum(count), .groups = "drop") %>%
+    group_by(sample) %>%
+    mutate(Value = Count / sum(Count)) %>%
+    rename(SampleID = sample, Taxon = genus) %>%
+    mutate(Domain = "Reads")
+}
+
+# 2. Contigs
+if (exists("all_metrics") && exists("contig_tax_full") && "genus" %in% colnames(contig_tax_full)) {
+  contig_tax_genus <- contig_tax_full[, .(contig_id, genus)]
+  contig_tax_genus <- unique(contig_tax_genus)
+  contig_joined <- merge(all_metrics, contig_tax_genus, by.x = "Contig", by.y = "contig_id", all.x = TRUE)
+  if (sum(!is.na(contig_joined$genus)) > 0) {
+    genus_data_list[["Contigs"]] <- contig_joined %>%
+      filter(!is.na(genus) & genus != "") %>%
+      group_by(SampleID, genus) %>%
+      summarise(Abundance = sum(Count), .groups = "drop") %>%
+      group_by(SampleID) %>%
+      mutate(Value = Abundance / sum(Abundance)) %>%
+      rename(Taxon = genus) %>%
+      mutate(Domain = "Contigs")
+  }
+}
+
+# 3. MAGs
+if (exists("mag_count_mat") && exists("mag_tax_parsed") && "genus" %in% colnames(mag_tax_parsed)) {
+  mag_tax_genus <- mag_tax_parsed[, c("MAG_ID", "genus")]
+  mag_tax_genus <- mag_tax_genus[!is.na(mag_tax_genus$genus) & mag_tax_genus$genus != "" & mag_tax_genus$genus != "Unclassified", ]
+  mag_tax_genus <- unique(mag_tax_genus)
+
+  genus_data_list[["MAGs"]] <- as.data.frame(as.matrix(mag_count_mat)) %>%
+    rownames_to_column("Genome") %>%
+    pivot_longer(-Genome, names_to = "SampleID", values_to = "Count") %>%
+    merge(mag_tax_genus, by.x = "Genome", by.y = "MAG_ID", all.x = FALSE) %>%
+    filter(!is.na(genus)) %>%
+    group_by(SampleID, genus) %>%
+    summarise(Count = sum(Count), .groups = "drop") %>%
+    group_by(SampleID) %>%
+    mutate(Value = Count / sum(Count)) %>%
+    rename(Taxon = genus) %>%
+    mutate(Domain = "MAGs")
+}
+
+if (length(genus_data_list) > 0) {
+  # Combine all data
+  df_all <- bind_rows(genus_data_list)
+  preferred_order <- c("Reads", "Contigs", "MAGs")
+  df_all$Domain <- factor(df_all$Domain, levels = preferred_order)
+  df_all_raw <- df_all
+
+  # Top genera across ALL domains
+  top_genera <- df_all %>%
+    group_by(Taxon) %>%
+    summarise(MeanVal = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(MeanVal, n = 20) %>%
+    arrange(desc(MeanVal)) %>%
+    pull(Taxon)
+
+  # Classify and group "Other"
+  df_all <- df_all %>%
+    mutate(DisplayTaxon = ifelse(Taxon %in% top_genera, Taxon, "Other")) %>%
+    group_by(SampleID, Domain, DisplayTaxon) %>%
+    summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+  df_all$DisplayTaxon <- factor(df_all$DisplayTaxon, levels = c(top_genera, "Other"))
+
+  # Build unified palette (safe for n < 3)
+  n_top <- length(top_genera)
+  if (n_top >= 3) {
+    pal_colors <- RColorBrewer::brewer.pal(min(n_top, 12), "Paired")
+    if (n_top > 12) pal_colors <- c(pal_colors, RColorBrewer::brewer.pal(min(n_top - 12, 12), "Set3"))
+    if (n_top > 24) pal_colors <- c(pal_colors, RColorBrewer::brewer.pal(min(n_top - 24, 8), "Dark2"))
+    pal_colors <- pal_colors[1:n_top]
+  } else {
+    pal_colors <- RColorBrewer::brewer.pal(3, "Paired")[1:n_top]
+  }
+  names(pal_colors) <- top_genera
+  unified_palette <- c(pal_colors, "Other" = "grey85")
+
+  # Add metadata (for Group4 facet)
+  meta_sub <- metadata
+  if (!"SampleID" %in% colnames(meta_sub)) meta_sub$SampleID <- rownames(meta_sub)
+  df_all <- left_join(df_all, meta_sub, by = "SampleID")
+
+  # Single faceted plot: Domain on rows (right labels), Group4 on columns
+  p_unified <- ggplot(df_all, aes(x = SampleID, y = Value, fill = DisplayTaxon)) +
+    geom_bar(stat = "identity", width = 0.9) +
+    facet_grid(Domain ~ Group4, scales = "free_x", space = "free_x", switch = "y") +
+    scale_fill_manual(values = unified_palette, drop = FALSE) +
+    guides(fill = guide_legend(ncol = 1)) +
+    theme_bw(base_size = 10) +
+    labs(y = "Relative Abundance", x = "", fill = "Genus") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 7),
+      strip.text.y.right = element_text(size = 11, face = "bold"),
+      strip.text.x = element_text(size = 10),
+      strip.background = element_rect(fill = "grey95"),
+      legend.position = "right",
+      legend.key.size = unit(0.6, "cm"),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 14, face = "bold"),
+      panel.spacing.y = unit(0.3, "cm")
+    )
+
+  print(p_unified)
+
+  ggsave(file.path(OUT_DIR, "FigS_summary_composition_vertical_genus_unified.pdf"),
+    p_unified,
+    width = 16, height = 18
+  )
+
+  # Build alternative palette
+  if (n_top >= 3) {
+    alt_colors <- RColorBrewer::brewer.pal(min(n_top, 12), "Set3")
+    if (n_top > 12) alt_colors <- c(alt_colors, RColorBrewer::brewer.pal(min(n_top - 12, 8), "Dark2"))
+    if (n_top > 20) alt_colors <- c(alt_colors, RColorBrewer::brewer.pal(min(n_top - 20, 12), "Paired"))
+    alt_colors <- alt_colors[1:n_top]
+  } else {
+    alt_colors <- RColorBrewer::brewer.pal(3, "Set3")[1:n_top]
+  }
+  names(alt_colors) <- top_genera
+  unified_palette_alt <- c(alt_colors, "Other" = "black")
+
+  p_unified_alt <- p_unified + scale_fill_manual(values = unified_palette_alt, drop = FALSE)
+
+  ggsave(file.path(OUT_DIR, "FigS_summary_composition_vertical_genus_unified_alt_colors.pdf"),
+    p_unified_alt,
+    width = 16, height = 18
+  )
+
+  # --- VERSION 3: Top 25 Genera ---
+  top_genera_25 <- df_all_raw %>%
+    group_by(Taxon) %>%
+    summarise(MeanVal = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(MeanVal, n = 25) %>%
+    arrange(desc(MeanVal)) %>%
+    pull(Taxon)
+
+  df_all_25 <- df_all_raw %>%
+    mutate(DisplayTaxon = ifelse(Taxon %in% top_genera_25, Taxon, "Other")) %>%
+    group_by(SampleID, Domain, DisplayTaxon) %>%
+    summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+  df_all_25$DisplayTaxon <- factor(df_all_25$DisplayTaxon, levels = c(top_genera_25, "Other"))
+
+  n_top_25 <- length(top_genera_25)
+  if (n_top_25 >= 3) {
+    pal_colors_25 <- RColorBrewer::brewer.pal(min(n_top_25, 12), "Paired")
+    if (n_top_25 > 12) pal_colors_25 <- c(pal_colors_25, RColorBrewer::brewer.pal(min(n_top_25 - 12, 12), "Set3"))
+    if (n_top_25 > 24) pal_colors_25 <- c(pal_colors_25, RColorBrewer::brewer.pal(min(n_top_25 - 24, 8), "Dark2"))
+    pal_colors_25 <- pal_colors_25[1:n_top_25]
+  } else {
+    pal_colors_25 <- RColorBrewer::brewer.pal(3, "Paired")[1:n_top_25]
+  }
+  names(pal_colors_25) <- top_genera_25
+  unified_palette_25 <- c(pal_colors_25, "Other" = "grey85")
+
+  df_all_25 <- left_join(df_all_25, meta_sub, by = "SampleID")
+
+  p_unified_25 <- ggplot(df_all_25, aes(x = SampleID, y = Value, fill = DisplayTaxon)) +
+    geom_bar(stat = "identity", width = 0.9) +
+    facet_grid(Domain ~ Group4, scales = "free_x", space = "free_x", switch = "y") +
+    scale_fill_manual(values = unified_palette_25, drop = FALSE) +
+    guides(fill = guide_legend(ncol = 1)) +
+    theme_bw(base_size = 10) +
+    labs(y = "Relative Abundance", x = "", fill = "Genus") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 7),
+      strip.text.y.right = element_text(size = 11, face = "bold"),
+      strip.text.x = element_text(size = 10),
+      strip.background = element_rect(fill = "grey95"),
+      legend.position = "right",
+      legend.key.size = unit(0.6, "cm"),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 14, face = "bold"),
+      panel.spacing.y = unit(0.3, "cm")
+    )
+
+  ggsave(file.path(OUT_DIR, "FigS_summary_composition_vertical_genus_unified_25taxa.pdf"),
+    p_unified_25,
+    width = 16, height = 18
+  )
+}
+```
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
+

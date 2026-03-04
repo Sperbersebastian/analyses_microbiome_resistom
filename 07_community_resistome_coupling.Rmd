@@ -1,0 +1,401 @@
+---
+title: "07 - Community–Resistome Coupling Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = FALSE, warning = FALSE, message = FALSE,
+    fig.width = 10, fig.height = 7
+)
+```
+
+# Overview
+
+This notebook tests whether **prokaryotic community composition** (MAGs) is
+coupled to the **contig-level resistome** (ARG drug-class and mechanism
+profiles). Coupling is assessed via:
+1. **Mantel test** — correlation between Aitchison distance matrices
+2. **Procrustes analysis** — superimposition of PCoA ordinations
+
+All distances are **Aitchison** (CLR + Euclidean), consistent with the
+compositional framework used throughout the project.
+
+---
+
+# 1. Setup and Data Loading
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+
+OUT_DIR <- file.path(RESULTS_DIR, "07_community_resistome_coupling")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+cat("Output directory:", OUT_DIR, "\n")
+```
+
+## Load Community and Resistome Matrices
+
+```{r load_data}
+# ---- Community Matrices ----
+mag_genus <- readRDS(file.path(RESULTS_DIR, "data_objects", "mag_genus_counts_filt.rds"))
+mag_species <- readRDS(file.path(RESULTS_DIR, "data_objects", "mag_species_counts_filt.rds"))
+
+# ---- Resistome Matrices ----
+arg_class <- readRDS(file.path(RESULTS_DIR, "data_objects", "arg_mat_contig.rds"))
+arg_mech <- readRDS(file.path(RESULTS_DIR, "data_objects", "arg_mech_mat_contig.rds"))
+
+cat("MAG genus:     ", nrow(mag_genus), "samples ×", ncol(mag_genus), "taxa\n")
+cat("MAG species:   ", nrow(mag_species), "samples ×", ncol(mag_species), "taxa\n")
+cat("ARG drug class:", nrow(arg_class), "samples ×", ncol(arg_class), "classes\n")
+cat("ARG mechanism: ", nrow(arg_mech), "samples ×", ncol(arg_mech), "mechanisms\n")
+```
+
+---
+
+# 2. Define Comparisons
+
+```{r define_comparisons}
+# Define the community–resistome pairings to test
+comparisons <- list(
+    list(
+        name        = "MAG Genus vs ARG Drug Class",
+        community   = mag_genus,
+        resistome   = arg_class,
+        comm_label  = "MAG Genus",
+        res_label   = "ARG Drug Class",
+        short_name  = "mag_genus_vs_arg_class"
+    ),
+    list(
+        name        = "MAG Genus vs ARG Mechanism",
+        community   = mag_genus,
+        resistome   = arg_mech,
+        comm_label  = "MAG Genus",
+        res_label   = "ARG Mechanism",
+        short_name  = "mag_genus_vs_arg_mech"
+    ),
+    list(
+        name        = "MAG Species vs ARG Drug Class",
+        community   = mag_species,
+        resistome   = arg_class,
+        comm_label  = "MAG Species",
+        res_label   = "ARG Drug Class",
+        short_name  = "mag_species_vs_arg_class"
+    ),
+    list(
+        name        = "MAG Species vs ARG Mechanism",
+        community   = mag_species,
+        resistome   = arg_mech,
+        comm_label  = "MAG Species",
+        res_label   = "ARG Mechanism",
+        short_name  = "mag_species_vs_arg_mech"
+    )
+)
+
+cat("Defined", length(comparisons), "community–resistome pairings:\n")
+for (cc in comparisons) cat(" •", cc$name, "\n")
+```
+
+---
+
+# 3. Coupling Analysis
+
+```{r run_coupling, fig.height=8, fig.width=10, results='asis'}
+# ---- Helper: run full coupling pipeline for one comparison ----
+run_coupling <- function(comp, metadata, group4_colors, out_dir) {
+    library(vegan)
+    library(ggrepel)
+
+    # 1. Match samples
+
+    common <- intersect(rownames(comp$community), rownames(comp$resistome))
+    if (length(common) < 3) {
+        cat("\n**", comp$name, "** — Skipped (only", length(common), "shared samples)\n\n")
+        return(NULL)
+    }
+
+    comm_sub <- comp$community[common, , drop = FALSE]
+    res_sub <- comp$resistome[common, , drop = FALSE]
+
+    # 2. Filter low-prevalence features
+    comm_filt <- filter_features(comm_sub)
+    res_filt <- filter_features(res_sub)
+
+    if (ncol(comm_filt) < 2 || ncol(res_filt) < 2) {
+        cat("\n**", comp$name, "** — Skipped (too few features after filtering)\n\n")
+        return(NULL)
+    }
+
+    # 3. CLR transform
+    comm_clr <- calc_clr(comm_filt)
+    res_clr <- calc_clr(res_filt)
+
+    # 4. Aitchison distance
+    comm_dist <- calc_aitchison(comm_clr)
+    res_dist <- calc_aitchison(res_clr)
+
+    # ============================
+    # 5. MANTEL TEST (Spearman)
+    # ============================
+    mantel_res <- vegan::mantel(comm_dist, res_dist,
+        method = "spearman", permutations = 9999
+    )
+
+    # ============================
+    # 6. PROCRUSTES + PROTEST
+    # ============================
+    comm_pcoa <- cmdscale(comm_dist, k = 2) # PCoA (classical MDS)
+    res_pcoa <- cmdscale(res_dist, k = 2)
+
+    proc <- vegan::procrustes(comm_pcoa, res_pcoa)
+    proc_test <- vegan::protest(comm_pcoa, res_pcoa, permutations = 9999)
+
+    # ============================
+    # 7. Build results list
+    # ============================
+    result <- list(
+        name              = comp$name,
+        short_name        = comp$short_name,
+        n_samples         = length(common),
+        n_comm_features   = ncol(comm_filt),
+        n_res_features    = ncol(res_filt),
+        mantel_r          = mantel_res$statistic,
+        mantel_p          = mantel_res$signif,
+        mantel_method     = "Spearman",
+        mantel_perms      = 9999,
+        procrustes_m2     = proc_test$ss,
+        procrustes_corr   = proc_test$t0,
+        procrustes_p      = proc_test$signif,
+        procrustes_perms  = 9999,
+        comm_label        = comp$comm_label,
+        res_label         = comp$res_label,
+        proc              = proc,
+        proc_test         = proc_test,
+        comm_pcoa         = comm_pcoa,
+        res_pcoa          = res_pcoa,
+        comm_dist         = comm_dist,
+        res_dist          = res_dist,
+        common_samples    = common
+    )
+
+    # ============================
+    # 8. Pretty Procrustes Plot
+    # ============================
+    # Build data frame for ggplot
+    target_df <- as.data.frame(proc$Yrot) # Target (rotated community)
+    rotated_df <- as.data.frame(proc$X) # Rotated resistome
+
+    colnames(target_df) <- c("tPC1", "tPC2")
+    colnames(rotated_df) <- c("rPC1", "rPC2")
+
+    target_df$Sample <- rownames(target_df)
+    rotated_df$Sample <- rownames(rotated_df)
+
+    plot_df <- merge(target_df, rotated_df, by = "Sample")
+    plot_df <- merge(plot_df, metadata, by.x = "Sample", by.y = "SampleID")
+
+    # Annotation text
+    annot_text <- paste0(
+        "Mantel r = ", round(result$mantel_r, 3),
+        " (p = ", format.pval(result$mantel_p, digits = 3), ")\n",
+        "Procrustes m² = ", round(result$procrustes_m2, 3),
+        " (p = ", format.pval(result$procrustes_p, digits = 3), ")"
+    )
+
+    p_proc <- ggplot(plot_df) +
+        # Arrows from community to resistome
+        geom_segment(aes(x = rPC1, y = rPC2, xend = tPC1, yend = tPC2),
+            arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+            color = "grey50", linewidth = 0.4, alpha = 0.7
+        ) +
+        # Community points (circles)
+        geom_point(aes(x = rPC1, y = rPC2, fill = Group4),
+            shape = 21, size = 4, stroke = 0.5
+        ) +
+        # Resistome points (triangles)
+        geom_point(aes(x = tPC1, y = tPC2, fill = Group4),
+            shape = 24, size = 4, stroke = 0.5
+        ) +
+        # Labels
+        geom_text_repel(aes(x = rPC1, y = rPC2, label = Sample),
+            size = 2.5, max.overlaps = 20, color = "grey30"
+        ) +
+        scale_fill_manual(values = group4_colors) +
+        # Statistics annotation
+        annotate("text",
+            x = Inf, y = -Inf, label = annot_text,
+            hjust = 1.05, vjust = -0.3, size = 3.5, fontface = "italic"
+        ) +
+        theme_bw(base_size = 13) +
+        labs(
+            title = paste("Procrustes:", comp$comm_label, "↔", comp$res_label),
+            subtitle = paste0(
+                "n = ", result$n_samples, " samples | ",
+                result$n_comm_features, " community features, ",
+                result$n_res_features, " resistome features"
+            ),
+            x = "Dimension 1",
+            y = "Dimension 2",
+            fill = "Management Group",
+            caption = paste0("●  = ", comp$comm_label, " (community)    ▲  = ", comp$res_label, " (resistome)")
+        ) +
+        theme(
+            plot.caption = element_text(hjust = 0.5, size = 10),
+            legend.position = "right"
+        )
+
+    # Save
+    ggsave(file.path(out_dir, paste0("procrustes_", comp$short_name, ".pdf")),
+        p_proc,
+        width = 10, height = 7
+    )
+    print(p_proc)
+
+    # ============================
+    # 9. Distance Matrix Scatter
+    # ============================
+    # Extract lower-triangle distances
+    comm_vec <- as.vector(comm_dist)
+    res_vec <- as.vector(res_dist)
+
+    dist_df <- data.frame(Community = comm_vec, Resistome = res_vec)
+
+    p_scatter <- ggplot(dist_df, aes(x = Community, y = Resistome)) +
+        geom_point(alpha = 0.6, size = 2, color = "#2166AC") +
+        geom_smooth(method = "lm", se = TRUE, color = "#B2182B", linewidth = 0.8) +
+        annotate("text",
+            x = Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+            label = paste0(
+                "Mantel r = ", round(result$mantel_r, 3),
+                "\np = ", format.pval(result$mantel_p, digits = 3)
+            ),
+            size = 4, fontface = "italic"
+        ) +
+        theme_bw(base_size = 13) +
+        labs(
+            title = paste("Distance Matrix Correlation:", comp$comm_label, "vs", comp$res_label),
+            x = paste(comp$comm_label, "— Aitchison Distance"),
+            y = paste(comp$res_label, "— Aitchison Distance")
+        )
+
+    ggsave(file.path(out_dir, paste0("mantel_scatter_", comp$short_name, ".pdf")),
+        p_scatter,
+        width = 8, height = 6
+    )
+    print(p_scatter)
+
+    return(result)
+}
+
+# ---- Run all comparisons ----
+all_results <- list()
+
+for (cc in comparisons) {
+    cat("\n\n## ", cc$name, "\n\n", sep = "")
+    res <- run_coupling(cc, metadata, group4_colors, OUT_DIR)
+    if (!is.null(res)) {
+        all_results[[cc$short_name]] <- res
+    }
+}
+```
+
+---
+
+# 4. Summary Table
+
+```{r summary_table}
+if (length(all_results) > 0) {
+    summary_df <- data.frame(
+        Comparison         = sapply(all_results, `[[`, "name"),
+        Samples            = sapply(all_results, `[[`, "n_samples"),
+        Community_Features = sapply(all_results, `[[`, "n_comm_features"),
+        Resistome_Features = sapply(all_results, `[[`, "n_res_features"),
+        Distance_Metric    = "Aitchison (CLR + Euclidean)",
+        Mantel_r           = round(sapply(all_results, `[[`, "mantel_r"), 4),
+        Mantel_p           = sapply(all_results, function(x) format.pval(x$mantel_p, digits = 3)),
+        Mantel_Method      = "Spearman",
+        Mantel_Perms       = sapply(all_results, `[[`, "mantel_perms"),
+        Procrustes_m2      = round(sapply(all_results, `[[`, "procrustes_m2"), 4),
+        Procrustes_corr    = round(sapply(all_results, `[[`, "procrustes_corr"), 4),
+        Procrustes_p       = sapply(all_results, function(x) format.pval(x$procrustes_p, digits = 3)),
+        Procrustes_Perms   = sapply(all_results, `[[`, "procrustes_perms"),
+        stringsAsFactors   = FALSE
+    )
+    rownames(summary_df) <- NULL
+
+    # Print
+    cat("\n=== Community–Resistome Coupling Summary ===\n\n")
+    print(knitr::kable(summary_df, format = "pipe", align = "l"))
+
+    # Save
+    write.csv(summary_df, file.path(OUT_DIR, "coupling_summary.csv"), row.names = FALSE)
+    cat("\nSaved to:", file.path(OUT_DIR, "coupling_summary.csv"), "\n")
+}
+```
+
+---
+
+# 5. Interpretation Guide
+
+```{r interpretation, results='asis'}
+cat("
+### How to Read These Results
+
+| Metric | Interpretation |
+|:-------|:---------------|
+| **Mantel r** | Correlation between distance matrices. Range: −1 to 1. Values > 0.3 suggest moderate coupling. |
+| **Mantel p** | Permutation p-value. Significant if < 0.05. |
+| **Procrustes m²** | Sum of squared residuals. **Lower = stronger concordance.** Range: 0 to 1. |
+| **Procrustes correlation** | Correlation in symmetric Procrustes rotation. **Higher = better fit.** |
+| **Procrustes p** | Permutation p-value from `protest()`. Significant if < 0.05. |
+
+**Distance metric:** Aitchison (CLR transformation with multiplicative zero replacement → Euclidean distance), chosen for its compositionality-aware properties.
+
+**Correlation method:** Spearman rank correlation (non-parametric, robust to outliers).
+
+**Permutations:** 9,999 per test, providing resolution down to p = 0.0001.
+
+### What the Procrustes plots show
+
+- **Circles (●)** = community ordination (MAG genus or species)
+- **Triangles (▲)** = resistome ordination (ARG drug class or mechanism)
+- **Arrows** connect the **same sample** in both ordinations
+- **Shorter arrows** = stronger agreement between community and resistome structure for that sample
+- Colors distinguish Management × Country groups
+")
+```
+
+---
+
+# 6. Save Results
+
+```{r save_results}
+if (length(all_results) > 0) {
+    # Save full results (without bulky objects)
+    save_results <- lapply(all_results, function(x) {
+        x$proc <- NULL
+        x$proc_test <- NULL
+        x$comm_pcoa <- NULL
+        x$res_pcoa <- NULL
+        x$comm_dist <- NULL
+        x$res_dist <- NULL
+        x
+    })
+    saveRDS(save_results, file.path(OUT_DIR, "coupling_results.rds"))
+    cat("Results saved to:", OUT_DIR, "\n")
+}
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

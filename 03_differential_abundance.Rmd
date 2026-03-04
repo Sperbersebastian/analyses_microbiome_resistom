@@ -1,0 +1,1058 @@
+---
+title: "03 - Differential Abundance Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+options(width = 120)
+
+# Reliable rendering (avoids fragile RStudio notebook cache):
+# rmarkdown::render("03_differential_abundance.Rmd", clean = TRUE)
+```
+
+# Differential Abundance (Prokaryotes, Plasmids, Viruses)
+
+**Descriptive:** differences among **Group4** (composite groups; confounded).
+**Inferential contrasts:**
+
+* **Management within Israel:** Org vs Conv
+* **Country within conventional only:** ISR vs USA
+
+---
+
+## Load setup + data
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+
+OUT_DIR <- file.path(RESULTS_DIR, "03_differential_abundance")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(exists("metadata"))
+stopifnot(all(c("SampleID", "Group4", "Country", "Management") %in% colnames(metadata)))
+if (!all(rownames(metadata) == metadata$SampleID)) rownames(metadata) <- metadata$SampleID
+```
+
+```{r load_data}
+mag_counts <- readRDS(file.path(RESULTS_DIR, "data_objects", "mag_species_counts_filt.rds"))
+cat("Loaded MAG counts:", nrow(mag_counts), "samples x", ncol(mag_counts), "species\n")
+
+plasmid_counts_path <- file.path(RESULTS_DIR, "data_objects", "plasmid_family_counts_filt.rds")
+plasmid_counts <- if (file.exists(plasmid_counts_path)) readRDS(plasmid_counts_path) else NULL
+if (!is.null(plasmid_counts)) cat("Loaded plasmid counts:", nrow(plasmid_counts), "samples x", ncol(plasmid_counts), "families\n")
+
+virus_counts_path <- file.path(RESULTS_DIR, "data_objects", "virus_counts_filt.rds")
+virus_counts <- if (file.exists(virus_counts_path)) readRDS(virus_counts_path) else NULL
+if (!is.null(virus_counts)) cat("Loaded virus counts:", nrow(virus_counts), "samples x", ncol(virus_counts), "vOTUs\n")
+
+# --- Rename vOTUs to human-readable short names (vOTU_001, vOTU_002, ...) ---
+# Ordered by total abundance (most abundant first)
+if (!is.null(virus_counts)) {
+  total_ab <- colSums(virus_counts)
+  rank_order <- order(total_ab, decreasing = TRUE)
+
+  votu_mapping <- data.frame(
+    original_id = colnames(virus_counts)[rank_order],
+    votu_name = sprintf("vOTU_%04d", seq_along(rank_order)),
+    total_abundance = total_ab[rank_order],
+    stringsAsFactors = FALSE
+  )
+
+  # Save the mapping table
+  write.table(votu_mapping, file.path(OUT_DIR, "votu_name_mapping.tsv"),
+    sep = "\t", row.names = FALSE, quote = FALSE
+  )
+  cat("Saved vOTU name mapping to:", file.path(OUT_DIR, "votu_name_mapping.tsv"), "\n")
+
+  # Apply the renaming to virus_counts
+  name_lookup <- setNames(votu_mapping$votu_name, votu_mapping$original_id)
+  colnames(virus_counts) <- name_lookup[colnames(virus_counts)]
+  cat("Renamed", ncol(virus_counts), "vOTUs (vOTU_0001 = most abundant)\n")
+}
+```
+
+```{r sanity_checks}
+cat("Group4:\n")
+print(table(metadata$Group4, useNA = "ifany"))
+cat("Country:\n")
+print(table(metadata$Country, useNA = "ifany"))
+cat("Management:\n")
+print(table(metadata$Management, useNA = "ifany"))
+
+stopifnot(length(intersect(rownames(mag_counts), rownames(metadata))) == nrow(metadata))
+stopifnot(all(mag_counts >= 0))
+
+if (!is.null(plasmid_counts)) {
+  stopifnot(length(intersect(rownames(plasmid_counts), rownames(metadata))) == nrow(metadata))
+  stopifnot(all(plasmid_counts >= 0))
+}
+if (!is.null(virus_counts)) {
+  stopifnot(length(intersect(rownames(virus_counts), rownames(metadata))) == nrow(metadata))
+  stopifnot(all(virus_counts >= 0))
+}
+```
+
+---
+
+# 1) Top taxa overview (Prokaryotes)
+
+```{r top_taxa_plot}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+rel_ab <- prop.table(as.matrix(mag_counts), 1)
+mean_ab <- colMeans(rel_ab)
+top_taxa <- names(sort(mean_ab, decreasing = TRUE)[1:min(15, length(mean_ab))])
+
+plot_df <- as.data.frame(rel_ab[, top_taxa, drop = FALSE]) %>%
+  tibble::rownames_to_column("SampleID") %>%
+  tidyr::pivot_longer(-SampleID, names_to = "Species", values_to = "RelAbund") %>%
+  dplyr::left_join(metadata, by = "SampleID")
+
+species_order <- plot_df %>%
+  group_by(Species) %>%
+  summarise(m = mean(RelAbund), .groups = "drop") %>%
+  arrange(desc(m)) %>%
+  pull(Species)
+
+p_top <- ggplot(plot_df, aes(x = factor(Species, levels = species_order), y = RelAbund, fill = Group4)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.size = 0.6) +
+  scale_fill_manual(values = group4_colors) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Top 15 Prokaryotic Species by Management \u00d7 Country", x = "Species", y = "Relative abundance")
+
+print(p_top)
+ggsave(file.path(OUT_DIR, "top_species_by_group4.pdf"), p_top, width = 10, height = 6)
+```
+
+---
+
+# 2) Contrasts
+
+```{r define_contrasts}
+suppressPackageStartupMessages(library(rlang))
+
+make_contrast <- function(name, filter_expr, design_col, levels = NULL, note = NULL) {
+  list(
+    name = name,
+    filter_expr = rlang::enquo(filter_expr),
+    design_col = design_col,
+    levels = levels,
+    note = note
+  )
+}
+
+contrasts <- list(
+  make_contrast(
+    "Global_Group4", TRUE, "Group4", NULL,
+    "Descriptive only (composite groups; confounded)."
+  ),
+  make_contrast(
+    "Israel_Management_Org_vs_Conv", Country == "ISR", "Management", c("Org", "Conv"),
+    "Inferential: management effect within Israel."
+  ),
+  make_contrast(
+    "Conventional_Country_ISR_vs_USA", Management == "Conv", "Country", c("ISR", "USA"),
+    "Inferential: country effect within conventional only."
+  )
+)
+
+print(lapply(contrasts, function(x) x[c("name", "design_col", "levels", "note")]))
+```
+
+---
+
+# 3) Helpers: filtering, CLR, orchard parsing
+
+```{r helpers}
+pick_prev_frac <- function(n) {
+  if (n <= 6) {
+    return(3 / 6)
+  }
+  if (n <= 9) {
+    return(4 / 9)
+  }
+  return(0.3)
+}
+
+domain_filter_params <- function(domain_name, n_samples) {
+  if (grepl("Viruses", domain_name, ignore.case = TRUE)) {
+    list(min_prev_frac = if (n_samples <= 9) 4 / 9 else 0.3, min_total = 20)
+  } else {
+    list(min_prev_frac = pick_prev_frac(n_samples), min_total = 10)
+  }
+}
+
+filter_counts <- function(counts_df, meta_sub, min_prev_frac = 0.3, min_total = 10) {
+  x <- counts_df[rownames(meta_sub), , drop = FALSE]
+  x <- x[, colSums(x) > 0, drop = FALSE]
+  if (ncol(x) == 0) {
+    return(x)
+  }
+
+  prev <- colMeans(x > 0)
+  keep_prev <- prev >= min_prev_frac
+  keep_total <- colSums(x) >= min_total
+  x[, keep_prev & keep_total, drop = FALSE]
+}
+
+summarize_matrix_qc <- function(counts_df, meta_sub) {
+  x <- counts_df[rownames(meta_sub), , drop = FALSE]
+  data.frame(
+    n_samples = nrow(x),
+    n_features = ncol(x),
+    libsize_min = min(rowSums(x)),
+    libsize_median = median(rowSums(x)),
+    libsize_max = max(rowSums(x)),
+    zero_frac_median = median(rowMeans(x == 0)),
+    zero_frac_max = max(rowMeans(x == 0))
+  )
+}
+
+# CLR transform (compositions-aware); returns samples x features matrix
+clr_transform <- function(counts_df_samples_x_features, pseudocount = 1e-6) {
+  suppressPackageStartupMessages(library(compositions))
+  x <- as.matrix(counts_df_samples_x_features)
+  rs <- rowSums(x)
+  if (any(rs == 0)) stop("Some samples have zero total counts after filtering.")
+  x <- x / rs
+  x[x == 0] <- pseudocount
+  compositions::clr(x)
+}
+
+# Heuristic orchard ID from SampleID:
+# strips terminal replicate suffix (_1/_2/_3), keeps remaining prefix.
+infer_orchard <- function(sample_id) {
+  sub("_[0-9]+$", "", sample_id)
+}
+
+# Human-readable domain names for plot titles
+pretty_domain <- function(d) {
+  switch(d,
+    "Prokaryotes_MAG_species" = "MAGs (Species)",
+    "Plasmids_host_family"    = "Plasmid Host Families",
+    "Viruses_vOTU"            = "Viral OTUs",
+    d # fallback
+  )
+}
+
+# Human-readable contrast names for plot titles
+pretty_contrast <- function(cc_name) {
+  switch(cc_name,
+    "Global_Group4"                     = "All Groups",
+    "Israel_Management_Org_vs_Conv"     = "Organic vs. Conventional (Israel)",
+    "Conventional_Country_ISR_vs_USA"   = "Israel vs. USA (Conventional)",
+    gsub("_", " ", cc_name) # fallback
+  )
+}
+```
+
+---
+
+# 4) Community plots + PERMANOVA (with dispersion) + optional stratified PERMANOVA
+
+```{r community_tests}
+plot_aitchison_pcoa <- function(counts_df, meta_sub, color_col, title, palette_named = NULL) {
+  suppressPackageStartupMessages(library(ggplot2))
+  clr <- clr_transform(counts_df[rownames(meta_sub), , drop = FALSE])
+  pcoa <- cmdscale(dist(clr), k = 2, eig = TRUE)
+
+  df <- data.frame(
+    SampleID = rownames(meta_sub),
+    PC1 = pcoa$points[, 1],
+    PC2 = pcoa$points[, 2],
+    Group = meta_sub[[color_col]]
+  )
+
+  p <- ggplot(df, aes(PC1, PC2, color = Group)) +
+    geom_point(size = 3) +
+    stat_ellipse(type = "t", linetype = "dashed", level = 0.68) +
+    theme_bw() +
+    labs(
+      title = title,
+      x = paste0("PC1 (", round(100 * pcoa$eig[1] / sum(pcoa$eig), 1), "%)"),
+      y = paste0("PC2 (", round(100 * pcoa$eig[2] / sum(pcoa$eig), 1), "%)")
+    )
+  if (!is.null(palette_named)) p <- p + scale_color_manual(values = palette_named)
+  p
+}
+
+run_aitchison_permanova <- function(counts_df, meta_sub, design_col, title_tag, output_dir, nperm = 999) {
+  suppressPackageStartupMessages(library(vegan))
+  clr <- clr_transform(counts_df[rownames(meta_sub), , drop = FALSE])
+  dist_mat <- dist(clr)
+
+  if (length(unique(meta_sub[[design_col]])) < 2) {
+    return(NULL)
+  }
+
+  ad <- vegan::adonis2(dist_mat ~ meta_sub[[design_col]], permutations = nperm)
+  bd <- vegan::betadisper(dist_mat, meta_sub[[design_col]])
+  bd_test <- vegan::permutest(bd, permutations = nperm)
+
+  out <- list(adonis = ad, betadisper = bd_test, nperm_requested = nperm)
+  saveRDS(out, file.path(output_dir, paste0("permanova_betadisper_", title_tag, ".rds")))
+  out
+}
+
+# Orchard-stratified PERMANOVA (reviewer-friendly).
+# Only runs if Orchard has >=2 strata AND each stratum has >=2 samples overall.
+run_stratified_permanova <- function(counts_df, meta_sub, design_col, strata_col, title_tag, output_dir, nperm = 999) {
+  suppressPackageStartupMessages(library(vegan))
+
+  if (!(strata_col %in% colnames(meta_sub))) {
+    return(NULL)
+  }
+  strata <- meta_sub[[strata_col]]
+
+  # Need at least 2 strata and some within-stratum replication
+  if (length(unique(strata)) < 2) {
+    return(NULL)
+  }
+  if (any(table(strata) < 2)) {
+    return(NULL)
+  }
+
+  clr <- clr_transform(counts_df[rownames(meta_sub), , drop = FALSE])
+  dist_mat <- dist(clr)
+
+  # permutations within strata
+  ad_str <- vegan::adonis2(dist_mat ~ meta_sub[[design_col]], permutations = nperm, strata = strata)
+
+  out <- list(adonis_stratified = ad_str, strata_col = strata_col, nperm_requested = nperm)
+  saveRDS(out, file.path(output_dir, paste0("permanova_stratified_", title_tag, ".rds")))
+  out
+}
+```
+
+---
+
+# 5) Prevalence enrichment (pairwise) + plot
+
+```{r prevalence}
+run_prevalence_enrichment <- function(counts_df, meta_sub, group_col, g1, g2, detect_thresh = 1) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+  })
+
+  meta_pair <- meta_sub %>% filter(.data[[group_col]] %in% c(g1, g2))
+  if (nrow(meta_pair) < 4) {
+    return(NULL)
+  }
+
+  x <- counts_df[rownames(meta_pair), , drop = FALSE]
+  x <- x[, colSums(x) > 0, drop = FALSE]
+  if (ncol(x) == 0) {
+    return(NULL)
+  }
+
+  y <- meta_pair[[group_col]]
+  present <- (x >= detect_thresh) * 1
+
+  res <- lapply(colnames(present), function(feat) {
+    tab <- table(y, present[, feat])
+    if (!all(c(g1, g2) %in% rownames(tab))) {
+      return(NULL)
+    }
+    if (!all(c(0, 1) %in% colnames(tab))) {
+      return(NULL)
+    }
+
+    tab <- tab[c(g1, g2), c("0", "1"), drop = FALSE]
+    ft <- fisher.test(tab)
+
+    prev_g1 <- mean(present[y == g1, feat] == 1)
+    prev_g2 <- mean(present[y == g2, feat] == 1)
+
+    data.frame(
+      feature = feat,
+      prev_g1 = prev_g1,
+      prev_g2 = prev_g2,
+      prev_diff = prev_g1 - prev_g2,
+      odds_ratio = unname(ft$estimate),
+      p = ft$p.value
+    )
+  }) %>% bind_rows()
+
+  if (is.null(res) || nrow(res) == 0) {
+    return(NULL)
+  }
+  res$q <- p.adjust(res$p, method = "BH")
+  res[order(res$q, -abs(res$prev_diff)), ]
+}
+
+plot_prevalence_shift <- function(prev_df, title, top_n = 20) {
+  suppressPackageStartupMessages(library(ggplot2))
+  if (is.null(prev_df) || nrow(prev_df) == 0) {
+    return(NULL)
+  }
+
+  df <- head(prev_df, top_n)
+  ggplot(df, aes(x = prev_diff, y = reorder(feature, prev_diff))) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_point(aes(size = abs(prev_diff), color = prev_diff > 0), alpha = 0.8) +
+    theme_bw() +
+    labs(title = title, x = "Prevalence Difference", y = "") +
+    guides(color = "none")
+}
+```
+
+---
+
+# 6) Feature-level DA: ANCOM-BC2 + optional ALDEx2 (pairwise only)
+
+```{r da_engines}
+pick_ancom_coef <- function(res_df) {
+  q_cols <- grep("^q_", colnames(res_df), value = TRUE)
+  q_cols_nonint <- setdiff(q_cols, "q_(Intercept)")
+  q_pick <- if (length(q_cols_nonint) > 0) q_cols_nonint[1] else q_cols[1]
+  sub("^q_", "", q_pick)
+}
+
+plot_ancombc_bars <- function(ancom_obj, title_tag, contrast_level = NULL, top_n = 20) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(ggplot2)
+  })
+  if (is.null(ancom_obj) || is.null(ancom_obj$res)) {
+    return(NULL)
+  }
+  res <- ancom_obj$res
+  if (!("taxon" %in% colnames(res))) {
+    return(NULL)
+  }
+
+  if (is.null(contrast_level)) contrast_level <- pick_ancom_coef(res)
+
+  lfc_col <- paste0("lfc_", contrast_level)
+  q_col <- paste0("q_", contrast_level)
+  if (!(lfc_col %in% colnames(res)) || !(q_col %in% colnames(res))) {
+    return(NULL)
+  }
+
+  sig_df <- res %>%
+    filter(!is.na(.data[[q_col]]), .data[[q_col]] < 0.05) %>%
+    arrange(desc(abs(.data[[lfc_col]]))) %>%
+    head(top_n)
+  if (nrow(sig_df) == 0) {
+    return(NULL)
+  }
+
+  ggplot(sig_df, aes(x = reorder(taxon, .data[[lfc_col]]), y = .data[[lfc_col]], fill = .data[[lfc_col]] > 0)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#2171B5", "FALSE" = "#CB181D"), labels = c("Depleted", "Enriched")) +
+    theme_bw() +
+    labs(title = paste0(title_tag, " \u2014 Differentially Abundant Taxa"), x = "", y = "Log Fold Change") +
+    guides(fill = guide_legend(title = "Direction"))
+}
+
+run_aldex2_pairwise <- function(counts_mat_features_x_samples, group_vec, mc.samples = 128, denom = "all") {
+  stopifnot(requireNamespace("ALDEx2", quietly = TRUE))
+  group_vec <- as.factor(group_vec)
+  if (nlevels(group_vec) != 2) {
+    return(NULL)
+  }
+
+  clr <- ALDEx2::aldex.clr(counts_mat_features_x_samples, group_vec,
+    mc.samples = mc.samples, denom = denom, verbose = FALSE
+  )
+  tt <- ALDEx2::aldex.ttest(clr, verbose = FALSE)
+  ef <- ALDEx2::aldex.effect(clr, verbose = FALSE)
+  res <- as.data.frame(cbind(tt, ef))
+  res$taxon <- rownames(res)
+  rownames(res) <- NULL
+  res
+}
+
+run_ancombc2 <- function(counts_df_samples_x_features, meta_df, group_col) {
+  stopifnot(requireNamespace("ANCOMBC", quietly = TRUE))
+
+  otu <- t(as.matrix(counts_df_samples_x_features)) # taxa x samples
+  meta <- meta_df
+  meta[[group_col]] <- as.factor(meta[[group_col]])
+
+  fit <- ANCOMBC::ancombc2(
+    data = otu,
+    meta_data = meta,
+    fix_formula = group_col,
+    rand_formula = NULL,
+    p_adj_method = "BH",
+    prv_cut = 0, lib_cut = 0,
+    group = group_col,
+    struc_zero = TRUE,
+    neg_lb = TRUE,
+    alpha = 0.05,
+    global = TRUE
+  )
+
+  out <- list(fit = fit, res = NULL, n_sig = NA_integer_)
+  if (!is.null(fit$res) && is.data.frame(fit$res)) {
+    out$res <- fit$res
+    diff_cols <- grep("^diff_", colnames(out$res), value = TRUE)
+    if (length(diff_cols) > 0) out$n_sig <- sum(out$res[, diff_cols] == TRUE, na.rm = TRUE)
+  }
+  out
+}
+
+run_da_suite <- function(counts_df_samples_x_features, meta_sub, group_col, output_dir, domain_name) {
+  suppressPackageStartupMessages(library(dplyr))
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  x <- counts_df_samples_x_features[rownames(meta_sub), , drop = FALSE]
+  x <- x[, colSums(x) > 0, drop = FALSE]
+
+  meta_sub[[group_col]] <- as.factor(meta_sub[[group_col]])
+  ng <- nlevels(meta_sub[[group_col]])
+
+  cat("\n=== Running DA Suite for:", domain_name, "===\n")
+  cat("Groups:", paste(levels(meta_sub[[group_col]]), collapse = ", "),
+    " (n=", nrow(meta_sub), ")\n",
+    sep = ""
+  )
+  cat("Taxa/features tested:", ncol(x), "\n")
+
+  # ALDEx2: ONLY for pairwise contrasts
+  aldex_res <- NULL
+  if (requireNamespace("ALDEx2", quietly = TRUE) && ng == 2) {
+    counts_mat <- t(as.matrix(x)) # features x samples
+    aldex_res <- tryCatch(
+      run_aldex2_pairwise(counts_mat, meta_sub[[group_col]]),
+      error = function(e) {
+        message("ALDEx2 failed: ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (!is.null(aldex_res)) {
+      saveRDS(aldex_res, file.path(output_dir, "aldex2_results.rds"))
+      write.csv(aldex_res, file.path(output_dir, "aldex2_results.csv"), row.names = FALSE)
+    }
+  }
+
+  # ANCOM-BC2 always
+  ancom_res <- NULL
+  ancom_global_tbl <- NULL
+  if (requireNamespace("ANCOMBC", quietly = TRUE)) {
+    ancom_res <- tryCatch(
+      run_ancombc2(x, meta_sub, group_col),
+      error = function(e) {
+        message("ANCOM-BC2 failed: ", conditionMessage(e))
+        NULL
+      }
+    )
+
+    if (!is.null(ancom_res) && !is.null(ancom_res$res) && is.data.frame(ancom_res$res)) {
+      saveRDS(ancom_res$res, file.path(output_dir, "ancombc2_results.rds"))
+      write.csv(ancom_res$res, file.path(output_dir, "ancombc2_results.csv"), row.names = FALSE)
+    }
+
+    if (!is.null(ancom_res) && !is.null(ancom_res$fit) && !is.null(ancom_res$fit$res_global)) {
+      ancom_global_tbl <- ancom_res$fit$res_global
+      if (is.data.frame(ancom_global_tbl) && !("taxon" %in% colnames(ancom_global_tbl))) {
+        ancom_global_tbl$taxon <- rownames(ancom_global_tbl)
+        rownames(ancom_global_tbl) <- NULL
+      }
+      saveRDS(ancom_global_tbl, file.path(output_dir, "ancombc2_global.rds"))
+      write.csv(ancom_global_tbl, file.path(output_dir, "ancombc2_global.csv"), row.names = FALSE)
+    }
+  }
+
+  list(aldex = aldex_res, ancom = ancom_res, ancom_global = ancom_global_tbl)
+}
+```
+
+---
+
+# 7) CLR heatmap + per-taxon boxplots (top 5–10)
+
+```{r clr_heatmap_boxplots}
+# Heatmap: uses ggplot tile (no extra dependencies)
+plot_clr_heatmap <- function(counts_df, meta_sub, feature_ids, group_col, title,
+                             scale_rows = TRUE, max_features = 40) {
+  suppressPackageStartupMessages({
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+    library(tibble)
+  })
+
+  feats <- unique(feature_ids)
+  feats <- feats[feats %in% colnames(counts_df)]
+  feats <- head(feats, max_features)
+  if (length(feats) < 2) {
+    return(NULL)
+  }
+
+  clr <- clr_transform(counts_df[rownames(meta_sub), feats, drop = FALSE])
+  mat <- as.matrix(clr)
+
+  if (scale_rows) {
+    mat <- t(scale(t(mat)))
+    mat[is.na(mat)] <- 0
+  }
+
+  df <- as.data.frame(mat) %>%
+    tibble::rownames_to_column("SampleID_row") %>%
+    tidyr::pivot_longer(-SampleID_row, names_to = "Feature", values_to = "CLR")
+
+  meta_join <- meta_sub %>%
+    tibble::rownames_to_column("SampleID_row")
+
+  df <- df %>%
+    dplyr::left_join(meta_join, by = "SampleID_row")
+
+  ggplot(df, aes(x = Feature, y = SampleID_row, fill = CLR)) +
+    geom_tile() +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8)
+    ) +
+    labs(title = title, x = "Feature", y = "Sample")
+}
+
+plot_top_taxa_boxplots <- function(counts_df, meta_sub, feature_ids, group_col, title, top_n = 10) {
+  suppressPackageStartupMessages({
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+    library(tibble)
+  })
+
+  feats <- unique(feature_ids)
+  feats <- feats[feats %in% colnames(counts_df)]
+  feats <- head(feats, top_n)
+  if (length(feats) < 1) {
+    return(NULL)
+  }
+
+  clr <- clr_transform(counts_df[rownames(meta_sub), feats, drop = FALSE])
+
+  df <- as.data.frame(clr) %>%
+    tibble::rownames_to_column("SampleID_row") %>%
+    tidyr::pivot_longer(-SampleID_row, names_to = "Feature", values_to = "CLR")
+
+  meta_join <- meta_sub %>%
+    tibble::rownames_to_column("SampleID_row")
+
+  df <- df %>%
+    dplyr::left_join(meta_join, by = "SampleID_row")
+
+  ggplot(df, aes(x = .data[[group_col]], y = CLR)) +
+    geom_boxplot(outlier.size = 0.6) +
+    geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+    facet_wrap(~Feature, scales = "free_y") +
+    theme_bw() +
+    labs(title = title, x = group_col, y = "CLR abundance")
+}
+```
+
+---
+
+# 8) Domain runner (prints tables + inline plots + saves PDFs) + stratified PERMANOVA
+
+```{r domain_runner}
+run_domain_for_all_contrasts <- function(counts_df_samples_x_features, domain_name, metadata, contrasts, out_dir, nperm = 999) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(knitr)
+    library(ggplot2)
+  })
+  results <- list()
+
+  for (cc in contrasts) {
+    meta_sub <- metadata %>% filter(!!cc$filter_expr)
+    meta_sub <- meta_sub[!is.na(meta_sub[[cc$design_col]]), , drop = FALSE]
+
+    # Add Orchard column (heuristic)
+    meta_sub$Orchard <- infer_orchard(rownames(meta_sub))
+
+    common <- intersect(rownames(counts_df_samples_x_features), rownames(meta_sub))
+    if (length(common) < 5) next
+    meta_sub <- meta_sub[common, , drop = FALSE]
+
+    qc_before <- summarize_matrix_qc(counts_df_samples_x_features, meta_sub)
+
+    fp <- domain_filter_params(domain_name, nrow(meta_sub))
+    counts_f <- filter_counts(
+      counts_df_samples_x_features, meta_sub,
+      min_prev_frac = fp$min_prev_frac,
+      min_total = fp$min_total
+    )
+
+    qc_after <- data.frame(
+      n_samples = nrow(meta_sub),
+      n_features = ncol(counts_f),
+      min_prev_frac_used = fp$min_prev_frac,
+      min_total_used = fp$min_total
+    )
+
+    contrast_dir <- file.path(out_dir, domain_name, cc$name)
+    dir.create(contrast_dir, recursive = TRUE, showWarnings = FALSE)
+    write.csv(qc_before, file.path(contrast_dir, "qc_before_filtering.csv"), row.names = FALSE)
+    write.csv(qc_after, file.path(contrast_dir, "qc_after_filtering.csv"), row.names = FALSE)
+
+    da <- run_da_suite(
+      counts_df_samples_x_features = counts_f,
+      meta_sub = meta_sub,
+      group_col = cc$design_col,
+      output_dir = contrast_dir,
+      domain_name = paste0(domain_name, "_", cc$name)
+    )
+
+    # Prevalence enrichment (pairwise only)
+    prev_res <- NULL
+    if (!is.null(cc$levels) && length(cc$levels) == 2) {
+      prev_res <- run_prevalence_enrichment(
+        counts_df = counts_f, meta_sub = meta_sub,
+        group_col = cc$design_col, g1 = cc$levels[1], g2 = cc$levels[2],
+        detect_thresh = 1
+      )
+      if (!is.null(prev_res)) {
+        saveRDS(prev_res, file.path(contrast_dir, "prevalence_enrichment.rds"))
+        write.csv(prev_res, file.path(contrast_dir, "prevalence_enrichment.csv"), row.names = FALSE)
+      }
+    }
+
+    # PERMANOVA + dispersion
+    perm <- run_aitchison_permanova(
+      counts_df = counts_f, meta_sub = meta_sub, design_col = cc$design_col,
+      title_tag = paste0(domain_name, "_", cc$name),
+      output_dir = contrast_dir, nperm = nperm
+    )
+
+    # Optional: orchard-stratified PERMANOVA (reviewer request)
+    perm_str <- run_stratified_permanova(
+      counts_df = counts_f, meta_sub = meta_sub,
+      design_col = cc$design_col, strata_col = "Orchard",
+      title_tag = paste0(domain_name, "_", cc$name),
+      output_dir = contrast_dir, nperm = nperm
+    )
+
+    # ---------- Inline reporting ----------
+    cat("\n\n## ", domain_name, " — ", cc$name, "\n", sep = "")
+    cat("Design: ", cc$design_col,
+      " | n_samples=", qc_after$n_samples,
+      " | n_features_tested=", qc_after$n_features, "\n",
+      sep = ""
+    )
+    if (!is.null(cc$note)) cat("Note: ", cc$note, "\n", sep = "")
+
+    if (cc$name == "Global_Group4") {
+      cat("\nNOTE: Global_Group4 is descriptive only (composite groups; confounded).\n")
+      cat("Feature-level DA should be treated as exploratory.\n")
+    }
+
+    cat("\nQC before filtering:\n")
+    print(knitr::kable(qc_before, digits = 3))
+    cat("\nQC after filtering:\n")
+    print(knitr::kable(qc_after, digits = 3))
+
+    # PCoA (inline + saved)
+    p_pcoa <- plot_aitchison_pcoa(
+      counts_df = counts_f, meta_sub = meta_sub,
+      color_col = cc$design_col,
+      title = paste0(pretty_domain(domain_name), " \u2014 ", pretty_contrast(cc$name), " (Aitchison PCoA)"),
+      palette_named = if (cc$design_col == "Group4") group4_colors else NULL
+    )
+    if (!is.null(p_pcoa)) {
+      print(p_pcoa)
+      ggsave(file.path(contrast_dir, "pcoa_aitchison.pdf"), p_pcoa, width = 8, height = 6)
+    }
+
+    # PERMANOVA outputs
+    if (!is.null(perm)) {
+      cat("\n### PERMANOVA (adonis2)\n")
+      print(perm$adonis)
+      cat("\n### Dispersion (betadisper permutest)\n")
+      print(perm$betadisper)
+      cat("\n(perm requested=", perm$nperm_requested, "; vegan used the number printed above)\n", sep = "")
+    }
+
+    if (!is.null(perm_str)) {
+      cat("\n### PERMANOVA stratified by Orchard (reviewer-style robustness)\n")
+      cat("Orchard strata levels:", length(unique(meta_sub$Orchard)), "\n")
+      print(perm_str$adonis_stratified)
+    } else {
+      cat("\n### PERMANOVA stratified by Orchard: not run (insufficient strata/replication in this subset).\n")
+    }
+
+    # ALDEx2 (pairwise only)
+    if (!is.null(da$aldex) && is.data.frame(da$aldex) && nrow(da$aldex) > 0) {
+      cat("\n### ALDEx2 (pairwise): top 15 by wi.eBH\n")
+      print(knitr::kable(head(da$aldex[order(da$aldex$wi.eBH), ], 15), digits = 3))
+    } else {
+      cat("\n### ALDEx2: not run (only valid for 2-level contrasts) or no results.\n")
+    }
+
+    # ANCOM-BC2 (non-intercept coefficient)
+    sig_features_for_plots <- character(0)
+
+    if (!is.null(da$ancom) && !is.null(da$ancom$res) && is.data.frame(da$ancom$res)) {
+      cat("\n### ANCOM-BC2 available coefficient columns\n")
+      print(colnames(da$ancom$res))
+
+      coef <- pick_ancom_coef(da$ancom$res)
+      q_col <- paste0("q_", coef)
+      lfc_col <- paste0("lfc_", coef)
+      diff_col <- paste0("diff_", coef)
+      diff_rob_col <- paste0("diff_robust_", coef)
+
+      if (q_col %in% colnames(da$ancom$res) && lfc_col %in% colnames(da$ancom$res)) {
+        cat("\n### ANCOM-BC2: top 15 by ", q_col, " (non-intercept)\n", sep = "")
+        top_an <- da$ancom$res[order(da$ancom$res[[q_col]]), ]
+        print(knitr::kable(head(top_an, 15), digits = 3))
+
+        sig_an <- da$ancom$res[
+          !is.na(da$ancom$res[[q_col]]) &
+            da$ancom$res[[q_col]] < 0.05 &
+            ((da$ancom$res[[diff_col]] == TRUE) | (da$ancom$res[[diff_rob_col]] == TRUE)), ,
+          drop = FALSE
+        ]
+        sig_an <- sig_an[order(sig_an[[q_col]]), , drop = FALSE]
+
+        if (nrow(sig_an) > 0) {
+          cat("\n### ANCOM-BC2 significant: q<0.05 for ", coef, "\n", sep = "")
+          print(knitr::kable(head(sig_an, 25), digits = 3))
+          sig_features_for_plots <- sig_an$taxon
+        } else {
+          cat("\n### ANCOM-BC2 significant: none at q<0.05 for ", coef, "\n", sep = "")
+        }
+
+        p_ancom <- plot_ancombc_bars(da$ancom, paste0(pretty_domain(domain_name), " \u2014 ", pretty_contrast(cc$name)), contrast_level = coef, top_n = 20)
+        if (!is.null(p_ancom)) {
+          print(p_ancom)
+          ggsave(file.path(contrast_dir, paste0("ancombc2_lfc_", coef, ".pdf")), p_ancom, width = 10, height = 7)
+        }
+      }
+    }
+
+    # ANCOM global omnibus (useful esp. for multi-group)
+    if (!is.null(da$ancom_global) && is.data.frame(da$ancom_global)) {
+      cat("\n### ANCOM-BC2 Global test (top 15 by q_val)\n")
+      gtab <- da$ancom_global[order(da$ancom_global$q_val), ]
+      print(knitr::kable(head(gtab, 15), digits = 3))
+    }
+
+    # Prevalence enrichment + plot
+    if (!is.null(prev_res) && is.data.frame(prev_res) && nrow(prev_res) > 0) {
+      cat("\n### Prevalence enrichment (top 15 by q)\n")
+      print(knitr::kable(head(prev_res, 15), digits = 3))
+
+      p_prev <- plot_prevalence_shift(prev_res, paste0(pretty_domain(domain_name), " \u2014 ", pretty_contrast(cc$name), " (Prevalence Shift)"), top_n = 20)
+      if (!is.null(p_prev)) {
+        print(p_prev)
+        ggsave(file.path(contrast_dir, "prevalence_shift.pdf"), p_prev, width = 9, height = 7)
+      }
+    }
+
+    # CLR heatmap + boxplots for significant ANCOM taxa (if any)
+    if (length(sig_features_for_plots) > 0) {
+      # Heatmap (top 40 sig)
+      p_hm <- plot_clr_heatmap(
+        counts_df = counts_f, meta_sub = meta_sub,
+        feature_ids = sig_features_for_plots,
+        group_col = cc$design_col,
+        title = paste0(pretty_domain(domain_name), " \u2014 ", pretty_contrast(cc$name), " (CLR Abundance Heatmap)"),
+        scale_rows = TRUE, max_features = 40
+      )
+      if (!is.null(p_hm)) {
+        print(p_hm)
+        ggsave(file.path(contrast_dir, "clr_heatmap_sig_ancom.pdf"), p_hm, width = 12, height = 7)
+      }
+
+      # Boxplots (top 10 sig)
+      p_box <- plot_top_taxa_boxplots(
+        counts_df = counts_f, meta_sub = meta_sub,
+        feature_ids = sig_features_for_plots,
+        group_col = cc$design_col,
+        title = paste0(pretty_domain(domain_name), " \u2014 ", pretty_contrast(cc$name), " (Top Differentially Abundant Taxa)"),
+        top_n = 10
+      )
+      if (!is.null(p_box)) {
+        print(p_box)
+        ggsave(file.path(contrast_dir, "clr_boxplots_top_sig_ancom.pdf"), p_box, width = 12, height = 7)
+      }
+    } else {
+      cat("\n### CLR heatmap/boxplots: skipped (no significant ANCOM taxa at q<0.05).\n")
+    }
+
+    results[[cc$name]] <- list(
+      contrast = cc,
+      meta = meta_sub,
+      counts_filtered = counts_f,
+      da = da,
+      prevalence = prev_res,
+      permanova = perm,
+      permanova_stratified = perm_str,
+      qc_before = qc_before,
+      qc_after = qc_after,
+      contrast_dir = contrast_dir
+    )
+  }
+
+  results
+}
+```
+
+---
+
+# 9) Run all domains
+
+```{r run_all_domains}
+NPERM <- 999
+
+prok_results <- run_domain_for_all_contrasts(
+  counts_df_samples_x_features = mag_counts,
+  domain_name = "Prokaryotes_MAG_species",
+  metadata = metadata,
+  contrasts = contrasts,
+  out_dir = OUT_DIR,
+  nperm = NPERM
+)
+
+plasmid_results <- if (!is.null(plasmid_counts)) {
+  run_domain_for_all_contrasts(
+    counts_df_samples_x_features = plasmid_counts,
+    domain_name = "Plasmids_host_family",
+    metadata = metadata,
+    contrasts = contrasts,
+    out_dir = OUT_DIR,
+    nperm = NPERM
+  )
+} else {
+  NULL
+}
+
+virus_results <- if (!is.null(virus_counts)) {
+  run_domain_for_all_contrasts(
+    counts_df_samples_x_features = virus_counts,
+    domain_name = "Viruses_vOTU",
+    metadata = metadata,
+    contrasts = contrasts,
+    out_dir = OUT_DIR,
+    nperm = NPERM
+  )
+} else {
+  NULL
+}
+```
+
+---
+
+# 10) Summary table
+
+```{r da_summary}
+suppressPackageStartupMessages(library(dplyr))
+
+get_aldex_sig <- function(res) {
+  if (is.null(res) || !is.data.frame(res) || nrow(res) == 0) {
+    return(NA_integer_)
+  }
+  if ("wi.eBH" %in% colnames(res)) {
+    return(sum(res$wi.eBH < 0.05, na.rm = TRUE))
+  }
+  NA_integer_
+}
+
+get_ancom_sig <- function(obj) {
+  if (is.null(obj) || is.null(obj$res) || !is.data.frame(obj$res)) {
+    return(NA_integer_)
+  }
+  diff_cols <- grep("^diff_", colnames(obj$res), value = TRUE)
+  if (length(diff_cols) == 0) {
+    return(NA_integer_)
+  }
+  sum(obj$res[, diff_cols] == TRUE, na.rm = TRUE)
+}
+
+summarize_domain <- function(domain_res, domain_label) {
+  if (is.null(domain_res)) {
+    return(NULL)
+  }
+
+  rows <- lapply(names(domain_res), function(nm) {
+    obj <- domain_res[[nm]]
+    da <- obj$da
+
+    coef_used <- NA_character_
+    ancom_sig_coef <- NA_integer_
+
+    if (!is.null(da$ancom) && !is.null(da$ancom$res) && is.data.frame(da$ancom$res)) {
+      coef_used <- pick_ancom_coef(da$ancom$res)
+      q_col <- paste0("q_", coef_used)
+      diff_col <- paste0("diff_", coef_used)
+      diff_rob_col <- paste0("diff_robust_", coef_used)
+      if (q_col %in% colnames(da$ancom$res)) {
+        ancom_sig_coef <- sum(
+          da$ancom$res[[q_col]] < 0.05 &
+            ((da$ancom$res[[diff_col]] == TRUE) | (da$ancom$res[[diff_rob_col]] == TRUE)),
+          na.rm = TRUE
+        )
+      }
+    }
+
+    data.frame(
+      Domain = domain_label,
+      Contrast = nm,
+      Design = obj$contrast$design_col,
+      n_samples = obj$qc_after$n_samples,
+      n_features_tested = obj$qc_after$n_features,
+      ALDEx2_sig = get_aldex_sig(da$aldex),
+      ANCOMBC2_sig_anycoef = get_ancom_sig(da$ancom),
+      ANCOMBC2_coef_used = coef_used,
+      ANCOMBC2_sig_coef = ancom_sig_coef,
+      ANCOMBC2_global_sig = if (!is.null(da$ancom_global) && is.data.frame(da$ancom_global)) {
+        sum(da$ancom_global$diff_abn == TRUE, na.rm = TRUE)
+      } else {
+        NA_integer_
+      },
+      PrevEnrich_sig = if (!is.null(obj$prevalence) && is.data.frame(obj$prevalence)) {
+        sum(obj$prevalence$q < 0.05, na.rm = TRUE)
+      } else {
+        NA_integer_
+      },
+      Stratified_PERMANOVA_run = !is.null(obj$permanova_stratified)
+    )
+  })
+
+  bind_rows(rows)
+}
+
+summary_all <- bind_rows(
+  summarize_domain(prok_results, "Prokaryotes_MAG_species"),
+  summarize_domain(plasmid_results, "Plasmids_host_family"),
+  summarize_domain(virus_results, "Viruses_vOTU")
+)
+
+knitr::kable(summary_all, caption = "DA Summary (ANCOM-BC2 + ALDEx2 pairwise + prevalence + stratified PERMANOVA)", digits = 3)
+write.csv(summary_all, file.path(OUT_DIR, "da_summary_all_domains.csv"), row.names = FALSE)
+```
+
+---
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

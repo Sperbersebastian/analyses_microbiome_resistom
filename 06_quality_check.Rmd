@@ -1,0 +1,234 @@
+---
+title: "06 - Recovery and Quality Landscape"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6)
+```
+
+# Q10: Recovery and Quality Landscape
+
+**Question:** How do recovery and genome quality vary among Group4?
+
+## Load Setup
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+
+OUT_DIR <- file.path(RESULTS_DIR, "06_quality")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+```
+
+---
+
+# 1. MAG Quality
+
+```{r mag_quality}
+mag_stats_path <- file.path(DATA_DIR, "02_MAGs/taxonomy/mag_stats_summary_with_taxonomy.tsv")
+
+if (file.exists(mag_stats_path)) {
+  mag_stats <- fread(mag_stats_path)
+
+  # Extract sample from MAG_ID
+  mag_stats <- mag_stats %>%
+    mutate(SampleID = gsub("_magscot_cleanbin_.*", "", MAG_ID)) %>%
+    left_join(metadata, by = "SampleID")
+
+  # Completeness vs Contamination
+  p_mag_quality <- ggplot(mag_stats, aes(x = Completeness, y = Contamination, color = Group4)) +
+    geom_point(size = 2, alpha = 0.7) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "MAG Quality: Completeness vs Contamination",
+      x = "Completeness (%)", y = "Contamination (%)"
+    )
+  print(p_mag_quality)
+  ggsave(file.path(OUT_DIR, "mag_quality_completeness_vs_contamination.pdf"), p_mag_quality, width = 7, height = 5)
+
+  # Quality tier distribution
+  p_mag_tier <- ggplot(mag_stats, aes(x = Group4, fill = Quality_Tier)) +
+    geom_bar(position = "fill") +
+    theme_bw(base_size = 12) +
+    labs(title = "MAG Quality Tier Distribution", y = "Proportion", x = "") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_mag_tier)
+  ggsave(file.path(OUT_DIR, "mag_quality_tier_distribution.pdf"), p_mag_tier, width = 6, height = 5)
+}
+```
+
+---
+
+# 2. Virus Quality
+
+```{r virus_quality}
+# Look for CheckV output or use DeepPhage quality info
+virus_lifestyle_path <- file.path(DATA_DIR, "04_Viruses/lifestyle")
+
+if (dir.exists(virus_lifestyle_path)) {
+  # Load DeepPhage data for quality metrics
+  lifestyle_files <- list.files(virus_lifestyle_path, pattern = "_deephage.csv", full.names = TRUE)
+
+  if (length(lifestyle_files) > 0) {
+    virus_data <- lapply(lifestyle_files, function(f) {
+      sample <- gsub("_deephage.csv", "", basename(f))
+      df <- fread(f)
+      df$Sample <- sample
+      return(df)
+    })
+    virus_data <- rbindlist(virus_data, fill = TRUE)
+    virus_data <- left_join(virus_data, metadata, by = c("Sample" = "SampleID"))
+
+    # Length distribution by Group4
+    if ("Length" %in% colnames(virus_data)) {
+      p_virus_length <- ggplot(virus_data, aes(x = Group4, y = log10(Length), fill = Group4)) +
+        geom_violin() +
+        geom_boxplot(width = 0.2) +
+        scale_fill_manual(values = group4_colors) +
+        theme_bw(base_size = 12) +
+        labs(
+          title = "Viral Contig Length Distribution",
+          y = "Log10(Length)", x = ""
+        )
+      print(p_virus_length)
+      ggsave(file.path(OUT_DIR, "virus_length_distribution.pdf"), p_virus_length, width = 6, height = 5)
+    }
+
+    # Count per sample
+    virus_counts <- virus_data %>%
+      group_by(Sample, Group4) %>%
+      summarise(
+        n_viruses = n(),
+        median_length = median(Length, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    knitr::kable(virus_counts, caption = "Virus Counts per Sample", digits = 0)
+  }
+} else {
+  message("Virus lifestyle directory not found.")
+}
+```
+
+---
+
+# 3. Plasmid Quality
+
+```{r plasmid_quality}
+# Load plasmid host lineage data for counts
+hotspot_dir <- file.path(DATA_DIR, "03_Plasmids/Host_lineage/HOTSPOT")
+
+if (dir.exists(hotspot_dir)) {
+  hotspot_files <- list.files(hotspot_dir, pattern = "host_lineage.tsv", recursive = TRUE, full.names = TRUE)
+
+  if (length(hotspot_files) > 0) {
+    plasmid_data <- lapply(hotspot_files, function(f) {
+      sample <- gsub("_results.*", "", basename(dirname(f)))
+      df <- fread(f)
+      df$Sample <- sample
+      # Extract length from Contig name
+      df$Length <- as.numeric(gsub(".*length_([0-9]+)_.*", "\\1", df$Contig))
+      return(df)
+    })
+    plasmid_data <- rbindlist(plasmid_data, fill = TRUE)
+    plasmid_data <- left_join(plasmid_data, metadata, by = c("Sample" = "SampleID"))
+
+    # Plasmid length by Group4
+    if ("Length" %in% colnames(plasmid_data) && sum(!is.na(plasmid_data$Length)) > 0) {
+      print(ggplot(plasmid_data, aes(x = Group4, y = log10(Length), fill = Group4)) +
+        geom_violin() +
+        geom_boxplot(width = 0.2) +
+        scale_fill_manual(values = group4_colors) +
+        theme_bw(base_size = 12) +
+        labs(
+          title = "Plasmid Length Distribution",
+          y = "Log10(Length)", x = ""
+        ))
+
+      ggsave(file.path(OUT_DIR, "plasmid_length_dist.pdf"), width = 6, height = 5)
+    }
+
+    # Plasmid counts per sample
+    plasmid_counts <- plasmid_data %>%
+      group_by(Sample, Group4) %>%
+      summarise(
+        n_plasmids = n(),
+        median_length = median(Length, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    knitr::kable(plasmid_counts, caption = "Plasmid Counts per Sample", digits = 0)
+  }
+} else {
+  message("Plasmid HOTSPOT directory not found.")
+}
+```
+
+---
+
+# 4. MAG Counts Summary
+
+```{r counts_summary}
+if (exists("mag_stats")) {
+  # MAGs per sample
+  mag_counts_per_sample <- mag_stats %>%
+    group_by(SampleID, Group4) %>%
+    summarise(
+      n_MAGs = n(),
+      n_HQ = sum(Quality_Tier == "HQ", na.rm = TRUE),
+      mean_completeness = mean(Completeness, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  knitr::kable(mag_counts_per_sample,
+    caption = "MAG Counts per Sample",
+    digits = 1
+  )
+}
+```
+
+---
+
+# 5. Summary Statistics
+
+```{r summary_stats}
+# Compile overall statistics
+summary_stats <- data.frame(
+  Entity = c("MAGs", "Viruses", "Plasmids"),
+  Total = c(
+    if (exists("mag_stats")) nrow(mag_stats) else NA,
+    if (exists("virus_data")) nrow(virus_data) else NA,
+    if (exists("plasmid_data")) nrow(plasmid_data) else NA
+  )
+)
+
+knitr::kable(summary_stats, caption = "Total Entity Counts")
+```
+
+---
+
+# Save Data
+
+```{r save}
+if (exists("mag_stats")) {
+  saveRDS(mag_stats, file.path(RESULTS_DIR, "data_objects", "mag_quality_stats.rds"))
+}
+if (exists("plasmid_data")) {
+  saveRDS(plasmid_data, file.path(RESULTS_DIR, "data_objects", "plasmid_quality.rds"))
+}
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

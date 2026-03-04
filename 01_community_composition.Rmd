@@ -1,0 +1,1785 @@
+---
+title: "01 - Community Composition Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6)
+# Ensure data.table is loaded for memory-optimized operations
+library(data.table)
+library(tidyverse)
+library(vegan)
+```
+
+# Q1: Community Composition
+
+**Question:** How does community composition differ among Group4 in prokaryotes, plasmids, viruses, and contigs?
+
+## Load Setup
+
+```{r load_setup}
+# Adjust this path to your specific setup file
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+
+OUT_DIR <- file.path(RESULTS_DIR, "01_community_composition")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+```
+
+---
+
+# 0. Reads (Genus Level)
+
+**Scientific Rationale:** Read-based analysis provides a comprehensive view of the entire community, including unbinned organisms. We aggregate to the **Genus** level to balance taxonomic resolution with classification confidence.
+
+## Load and Process Read Taxonomy
+
+```{r load_reads_beta}
+# Load all read taxonomy files
+reads_dir <- file.path(DATA_DIR, "00_reads/Taxonomy")
+read_files <- list.files(reads_dir, pattern = "_combined\\.tsv$", full.names = TRUE)
+
+cat("Found", length(read_files), "read taxonomy files.\n")
+
+# Read and combine all files
+read_data_list <- lapply(read_files, fread)
+read_data <- rbindlist(read_data_list, fill = TRUE)
+
+# Filter to valid GTDB Bacteria/Archaea AND NT sources (Removed filter to include all)
+read_data_clean <- read_data %>%
+  correct_gtdb_taxonomy()
+# dplyr::filter(source %in% c("GTDB", "NT") & kingdom %in% c("Bacteria", "Archaea"))
+
+# Aggregate to Genus Level
+read_genus_agg <- read_data_clean %>%
+  filter(!is.na(genus) & genus != "" & genus != "-") %>%
+  group_by(sample, genus) %>%
+  summarise(Count = sum(count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = genus, values_from = Count, values_fill = 0) %>%
+  column_to_rownames("sample")
+
+# Align with Metadata
+common_samples_reads <- intersect(rownames(read_genus_agg), rownames(metadata))
+read_genus_agg <- read_genus_agg[common_samples_reads, , drop = FALSE]
+read_genus_filt <- filter_features(read_genus_agg)
+
+cat("Samples:", nrow(read_genus_filt), "\n")
+cat("Genera:", ncol(read_genus_filt), "\n")
+```
+
+## CLR and Aitchison Distance (Reads)
+
+```{r clr_reads}
+# CLR Transformation (handles zeros internally via pseudo-count usually,
+# but check calc_clr implementation. If features are sparse, robust CLR is better.
+# Here we assume calc_clr uses standard CLR with small pseudo-count if zero)
+read_clr <- calc_clr(read_genus_filt)
+read_dist <- calc_aitchison(read_clr)
+```
+
+## PCA Ordination (Reads)
+
+```{r pca_reads}
+# PCA on CLR-transformed data (Aitchison PCA)
+read_pca <- prcomp(read_clr)
+read_pca_df <- as.data.frame(read_pca$x)
+read_pca_df$SampleID <- rownames(read_pca_df)
+read_pca_df <- left_join(read_pca_df, metadata, by = "SampleID")
+
+# Variance explained
+var_explained_read <- round(100 * read_pca$sdev^2 / sum(read_pca$sdev^2), 1)
+
+p_pca_reads <- ggplot(read_pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Reads (Genus) - PCA (Aitchison)",
+    x = paste0("PC1 (", var_explained_read[1], "%)"),
+    y = paste0("PC2 (", var_explained_read[2], "%)")
+  )
+
+print(p_pca_reads)
+
+p_pca_reads_country <- ggplot(read_pca_df, aes(x = PC1, y = PC2, color = Group4, shape = Country)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Reads (Genus) - PCA (Aitchison) + Country",
+    x = paste0("PC1 (", var_explained_read[1], "%)"),
+    y = paste0("PC2 (", var_explained_read[2], "%)")
+  )
+
+print(p_pca_reads_country)
+ggsave(file.path(OUT_DIR, "reads_pca_country.pdf"), plot = p_pca_reads_country, width = 6, height = 5)
+```
+
+## PERMANOVA (Reads)
+
+```{r permanova_reads}
+meta_ordered_reads <- metadata[rownames(as.matrix(read_dist)), ]
+perm_read <- adonis2(read_dist ~ Group4, data = meta_ordered_reads, permutations = 999)
+knitr::kable(perm_read, caption = "PERMANOVA: Reads (Genus) ~ Group4")
+
+# PERMANOVA: Country * Management
+perm_read_int <- adonis2(read_dist ~ Country * Management, data = meta_ordered_reads, permutations = 999, by = "terms")
+knitr::kable(perm_read_int, caption = "PERMANOVA: Reads (Genus) ~ Country * Management")
+
+# Dispersion
+disp_read <- calc_betadisper(read_dist, meta_ordered_reads$Group4)
+print(plot(disp_read$mod, main = "Reads Dispersion"))
+pdf(file.path(OUT_DIR, "reads_dispersion.pdf"), width = 6, height = 5)
+plot(disp_read$mod, main = "Reads Dispersion")
+dev.off()
+knitr::kable(disp_read$test$tab, caption = "Beta Dispersion: Reads")
+
+# Pairwise
+pair_read <- calc_pairwise_permanova(read_dist, meta_ordered_reads$Group4)
+knitr::kable(pair_read, digits = 4, caption = "Pairwise PERMANOVA: Reads (BH adjusted)")
+```
+
+## Save Data (Reads)
+
+```{r save_reads}
+saveRDS(read_genus_filt, file.path(RESULTS_DIR, "data_objects", "read_genus_counts_filt.rds"))
+ggsave(file.path(OUT_DIR, "reads_pca.pdf"), plot = p_pca_reads, width = 6, height = 5)
+
+# Biplot (Manual for Custom Style)
+library(ggrepel)
+loadings_r <- as.data.frame(read_pca$rotation)
+loadings_r$Feature <- rownames(loadings_r)
+loadings_r$Magnitude <- sqrt(loadings_r$PC1^2 + loadings_r$PC2^2)
+top_loadings_r <- loadings_r %>% slice_max(Magnitude, n = 5)
+
+r_points <- max(abs(read_pca_df$PC1), abs(read_pca_df$PC2))
+r_arrows <- max(abs(top_loadings_r$PC1), abs(top_loadings_r$PC2))
+scale_factor_r <- r_points / r_arrows * 0.8
+
+top_loadings_r$PC1 <- top_loadings_r$PC1 * scale_factor_r
+top_loadings_r$PC2 <- top_loadings_r$PC2 * scale_factor_r
+
+p_biplot_reads <- ggplot(read_pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+  geom_segment(data = top_loadings_r, aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.3, "cm")), color = "grey40") +
+  geom_text_repel(data = top_loadings_r, aes(x = PC1, y = PC2, label = Feature), size = 4, fontface = "bold", color = "black") +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(title = "Reads (Genus) - Biplot", x = paste0("PC1 (", var_explained_read[1], "%)"), y = paste0("PC2 (", var_explained_read[2], "%)"))
+
+print(p_biplot_reads)
+ggsave(file.path(OUT_DIR, "reads_pca_biplot.pdf"), plot = p_biplot_reads, width = 7, height = 6)
+
+# Scree Plot
+print(plot_pca_scree(read_pca))
+ggsave(file.path(OUT_DIR, "reads_pca_scree.pdf"), width = 6, height = 5)
+```
+
+---
+
+# 1. Prokaryotes (MAG-based)
+
+**Scientific Rationale:** For bacteria, we aggregate to the **Species level**. This provides maximum taxonomic resolution for distinguishing community differences between samples.
+
+## Load Data
+
+```{r load_mags}
+mag_counts_path <- file.path(DATA_DIR, "02_MAGs/coverage/coverm_results.tsv")
+mag_stats_path <- file.path(DATA_DIR, "02_MAGs/taxonomy/mag_stats_summary_with_taxonomy.tsv")
+
+mag_counts <- fread(mag_counts_path)
+mag_stats <- fread(mag_stats_path)
+```
+
+## Process Abundance Matrix
+
+```{r process_mags}
+# Extract Relative Abundance columns (coverage-based composition)
+abund_cols <- grep("Relative Abundance \\(%\\)", colnames(mag_counts), value = TRUE)
+mag_abund_mat <- mag_counts %>%
+  dplyr::select(Genome, all_of(abund_cols)) %>%
+  column_to_rownames("Genome")
+
+# Clean column names
+colnames(mag_abund_mat) <- gsub("\\.sorted Relative Abundance \\(%\\)", "", colnames(mag_abund_mat))
+```
+
+## Parse Taxonomy
+
+```{r parse_taxonomy}
+# Use MAG_ID to join with CoverM Genome column
+mag_tax_parsed <- mag_stats %>%
+  dplyr::select(MAG_ID, classification) %>%
+  distinct(MAG_ID, .keep_all = TRUE) %>%
+  separate(classification,
+    into = c("domain", "phylum", "class", "order", "family", "genus", "species"),
+    sep = ";"
+  ) %>%
+  mutate(across(everything(), ~ gsub("^[a-z]__", "", .))) %>%
+  mutate(species = ifelse(species == "" | is.na(species), "Unclassified", species))
+```
+
+## Aggregate to Species Level
+
+```{r aggregate_species}
+mag_abund_long <- mag_abund_mat %>%
+  rownames_to_column("Genome") %>%
+  pivot_longer(-Genome, names_to = "SampleID", values_to = "Abundance") %>%
+  left_join(mag_tax_parsed, by = c("Genome" = "MAG_ID"))
+
+mag_species_abund <- mag_abund_long %>%
+  group_by(SampleID, species) %>%
+  summarise(Abundance = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = species, values_from = Abundance, values_fill = 0) %>%
+  column_to_rownames("SampleID")
+
+# Align with metadata
+common_samples <- intersect(rownames(mag_species_abund), rownames(metadata))
+mag_species_abund <- mag_species_abund[common_samples, , drop = FALSE]
+
+# Filter
+mag_species_abund_filt <- filter_features(mag_species_abund)
+
+cat("Samples:", nrow(mag_species_abund_filt), "\n")
+cat("Species:", ncol(mag_species_abund_filt), "\n")
+```
+
+## CLR and Aitchison Distance
+
+```{r clr_mags}
+mag_clr <- calc_clr(mag_species_abund_filt)
+mag_dist <- calc_aitchison(mag_clr)
+```
+
+## PCA Ordination
+
+```{r pca_mags}
+# PCA on CLR-transformed data (Aitchison PCA)
+mag_pca <- prcomp(mag_clr)
+mag_pca_df <- as.data.frame(mag_pca$x)
+mag_pca_df$SampleID <- rownames(mag_pca_df)
+mag_pca_df <- left_join(mag_pca_df, metadata, by = "SampleID")
+
+# Variance explained
+var_explained <- round(100 * mag_pca$sdev^2 / sum(mag_pca$sdev^2), 1)
+
+p_pca_mags <- ggplot(mag_pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Prokaryotes (Species) - PCA (Aitchison)",
+    x = paste0("PC1 (", var_explained[1], "%)"),
+    y = paste0("PC2 (", var_explained[2], "%)")
+  )
+print(p_pca_mags)
+ggsave(file.path(OUT_DIR, "prokaryotes_pca_basic.pdf"), p_pca_mags, width = 6, height = 5)
+
+p_pca_mags_country <- ggplot(mag_pca_df, aes(x = PC1, y = PC2, color = Group4, shape = Country)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "MAGs (Species) - PCA (Aitchison)",
+    x = paste0("PC1 (", var_explained[1], "%)"),
+    y = paste0("PC2 (", var_explained[2], "%)")
+  )
+
+print(p_pca_mags_country)
+ggsave(file.path(OUT_DIR, "prokaryotes_pca_country.pdf"), plot = p_pca_mags_country, width = 6, height = 5)
+```
+
+## PERMANOVA
+
+```{r permanova_mags}
+meta_ordered <- metadata[rownames(as.matrix(mag_dist)), ]
+perm_mag <- adonis2(mag_dist ~ Group4, data = meta_ordered, permutations = 999)
+knitr::kable(perm_mag, caption = "PERMANOVA: Prokaryotes ~ Group4")
+
+# PERMANOVA: Country * Management
+perm_mag_int <- adonis2(mag_dist ~ Country * Management, data = meta_ordered, permutations = 999, by = "terms")
+knitr::kable(perm_mag_int, caption = "PERMANOVA: Prokaryotes ~ Country * Management")
+
+# Dispersion
+disp_mag <- calc_betadisper(mag_dist, meta_ordered$Group4)
+print(plot(disp_mag$mod, main = "Prokaryotes Dispersion"))
+pdf(file.path(OUT_DIR, "prokaryotes_dispersion.pdf"), width = 6, height = 5)
+plot(disp_mag$mod, main = "Prokaryotes Dispersion")
+dev.off()
+knitr::kable(disp_mag$test$tab, caption = "Beta Dispersion: Prokaryotes")
+
+# Pairwise PERMANOVA
+pair_mag <- calc_pairwise_permanova(mag_dist, meta_ordered$Group4)
+knitr::kable(pair_mag, digits = 4, caption = "Pairwise PERMANOVA: Prokaryotes (BH adjusted)")
+```
+
+## Save Data
+
+```{r save_mags}
+saveRDS(mag_species_abund_filt, file.path(RESULTS_DIR, "data_objects", "mag_species_abund_filt.rds"))
+ggsave(file.path(OUT_DIR, "prokaryotes_pca.pdf"), width = 6, height = 5)
+
+# Biplot (Manual for Custom Style)
+library(ggrepel)
+loadings_m <- as.data.frame(mag_pca$rotation)
+loadings_m$Feature <- rownames(loadings_m)
+loadings_m$Magnitude <- sqrt(loadings_m$PC1^2 + loadings_m$PC2^2)
+top_loadings_m <- loadings_m %>% slice_max(Magnitude, n = 5)
+
+r_points <- max(abs(mag_pca_df$PC1), abs(mag_pca_df$PC2))
+r_arrows <- max(abs(top_loadings_m$PC1), abs(top_loadings_m$PC2))
+scale_factor_m <- r_points / r_arrows * 0.8
+
+top_loadings_m$PC1 <- top_loadings_m$PC1 * scale_factor_m
+top_loadings_m$PC2 <- top_loadings_m$PC2 * scale_factor_m
+
+p_biplot_mags <- ggplot(mag_pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+  geom_segment(data = top_loadings_m, aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.3, "cm")), color = "grey40") +
+  geom_text_repel(data = top_loadings_m, aes(x = PC1, y = PC2, label = Feature), size = 4, fontface = "bold", color = "black") +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(title = "Prokaryotes (Species) - Biplot", x = paste0("PC1 (", var_explained[1], "%)"), y = paste0("PC2 (", var_explained[2], "%)"))
+
+print(p_biplot_mags)
+ggsave(file.path(OUT_DIR, "prokaryotes_pca_biplot.pdf"), plot = p_biplot_mags, width = 7, height = 6)
+
+# Scree Plot
+print(plot_pca_scree(mag_pca))
+ggsave(file.path(OUT_DIR, "prokaryotes_pca_scree.pdf"), width = 6, height = 5)
+```
+
+## Normalization Comparison
+
+This section compares multiple normalization methods for prokaryote community analysis.
+
+### Load All CoverM Metrics
+
+```{r load_all_metrics}
+# Extract Read Count columns
+count_cols <- grep("Read Count", colnames(mag_counts), value = TRUE)
+mag_count_mat <- mag_counts %>%
+  dplyr::select(Genome, all_of(count_cols)) %>%
+  column_to_rownames("Genome")
+colnames(mag_count_mat) <- gsub("\\.sorted Read Count", "", colnames(mag_count_mat))
+
+# Extract RPKM columns
+rpkm_cols <- grep("RPKM", colnames(mag_counts), value = TRUE)
+mag_rpkm_mat <- mag_counts %>%
+  dplyr::select(Genome, all_of(rpkm_cols)) %>%
+  column_to_rownames("Genome")
+colnames(mag_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(mag_rpkm_mat))
+
+# Aggregate Read Counts to species level
+mag_count_long <- mag_count_mat %>%
+  rownames_to_column("Genome") %>%
+  pivot_longer(-Genome, names_to = "SampleID", values_to = "Count") %>%
+  left_join(mag_tax_parsed, by = c("Genome" = "MAG_ID"))
+
+mag_species_counts <- mag_count_long %>%
+  group_by(SampleID, species) %>%
+  summarise(Count = sum(Count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = species, values_from = Count, values_fill = 0) %>%
+  column_to_rownames("SampleID")
+
+# Aggregate RPKM to species level
+mag_rpkm_long <- mag_rpkm_mat %>%
+  rownames_to_column("Genome") %>%
+  pivot_longer(-Genome, names_to = "SampleID", values_to = "RPKM") %>%
+  left_join(mag_tax_parsed, by = c("Genome" = "MAG_ID"))
+
+mag_species_rpkm <- mag_rpkm_long %>%
+  group_by(SampleID, species) %>%
+  summarise(RPKM = sum(RPKM, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = species, values_from = RPKM, values_fill = 0) %>%
+  column_to_rownames("SampleID")
+
+# Align with metadata
+common_samples <- intersect(rownames(mag_species_counts), rownames(metadata))
+mag_species_counts <- mag_species_counts[common_samples, , drop = FALSE]
+mag_species_rpkm <- mag_species_rpkm[common_samples, , drop = FALSE]
+
+# Filter low-abundance species
+mag_species_counts_filt <- filter_features(mag_species_counts)
+mag_species_rpkm_filt <- filter_features(mag_species_rpkm)
+
+cat("Species count matrix:", dim(mag_species_counts_filt), "\n")
+cat("Species RPKM matrix:", dim(mag_species_rpkm_filt), "\n")
+```
+
+### Normalization Functions
+
+```{r normalization_functions}
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(metagenomeSeq)
+  library(DESeq2)
+  library(GMPR)
+})
+
+# TSS: Total Sum Scaling
+norm_tss <- function(mat) {
+  sweep(mat, 1, rowSums(mat), "/")
+}
+
+# CSS: Cumulative Sum Scaling (metagenomeSeq)
+norm_css <- function(mat) {
+  # CSS works on features x samples (transposed)
+  MRobj <- newMRexperiment(t(mat))
+  MRobj <- cumNorm(MRobj, p = cumNormStatFast(MRobj))
+  t(MRcounts(MRobj, norm = TRUE, log = FALSE))
+}
+
+# TMM: Trimmed Mean of M-values (edgeR)
+norm_tmm <- function(mat) {
+  dge <- edgeR::DGEList(counts = t(mat))
+  dge <- edgeR::calcNormFactors(dge, method = "TMM")
+  t(edgeR::cpm(dge, normalized.lib.sizes = TRUE))
+}
+
+# GMPR: Geometric Mean of Pairwise Ratios
+norm_gmpr <- function(mat) {
+  # GMPR returns size factors
+  size_factors <- GMPR(t(mat))
+  sweep(mat, 1, size_factors, "/")
+}
+
+# Presence/Absence for Jaccard
+to_presence_absence <- function(mat) {
+  (mat > 0) * 1
+}
+```
+
+### Bray-Curtis PCoA Comparison
+
+```{r bray_curtis_pcoa, fig.width=12, fig.height=12}
+# Apply normalizations
+tss_mat <- norm_tss(as.matrix(mag_species_counts_filt))
+css_mat <- tryCatch(norm_css(as.matrix(mag_species_counts_filt)), error = function(e) NULL)
+tmm_mat <- tryCatch(norm_tmm(as.matrix(mag_species_counts_filt)), error = function(e) NULL)
+gmpr_mat <- tryCatch(norm_gmpr(as.matrix(mag_species_counts_filt)), error = function(e) NULL)
+
+# Helper function for PCoA plot with error handling
+plot_pcoa <- function(dist_mat, title, metadata_df) {
+  pcoa <- tryCatch(
+    {
+      cmdscale(dist_mat, eig = TRUE, k = 2)
+    },
+    error = function(e) NULL
+  )
+
+  if (is.null(pcoa) || ncol(pcoa$points) < 2) {
+    return(ggplot() +
+      annotate("text", x = 0.5, y = 0.5, label = paste(title, "\n(insufficient variation)")) +
+      theme_void())
+  }
+
+  pcoa_df <- as.data.frame(pcoa$points)
+  colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+  pcoa_df$SampleID <- rownames(pcoa_df)
+  pcoa_df <- left_join(pcoa_df, metadata_df, by = "SampleID")
+
+  eig <- pcoa$eig
+  var_exp <- round(100 * eig[1:2] / sum(eig[eig > 0]), 1)
+
+  ggplot(pcoa_df, aes(x = PCoA1, y = PCoA2, color = Group4)) +
+    geom_point(size = 3) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 10) +
+    labs(
+      title = title,
+      x = paste0("PCoA1 (", var_exp[1], "%)"),
+      y = paste0("PCoA2 (", var_exp[2], "%)")
+    ) +
+    theme(legend.position = "bottom")
+}
+
+# Create plots
+plots <- list()
+
+# TSS + Bray-Curtis
+dist_tss <- vegdist(tss_mat, method = "bray")
+plots$tss <- plot_pcoa(dist_tss, "Bray-Curtis (TSS)", metadata)
+
+# CSS + Bray-Curtis
+if (!is.null(css_mat)) {
+  dist_css <- vegdist(css_mat, method = "bray")
+  plots$css <- plot_pcoa(dist_css, "Bray-Curtis (CSS)", metadata)
+}
+
+# TMM + Bray-Curtis
+if (!is.null(tmm_mat)) {
+  dist_tmm <- vegdist(tmm_mat, method = "bray")
+  plots$tmm <- plot_pcoa(dist_tmm, "Bray-Curtis (TMM)", metadata)
+}
+
+# GMPR + Bray-Curtis
+if (!is.null(gmpr_mat)) {
+  dist_gmpr <- vegdist(gmpr_mat, method = "bray")
+  plots$gmpr <- plot_pcoa(dist_gmpr, "Bray-Curtis (GMPR)", metadata)
+}
+
+# CLR + Bray-Curtis (compositional transformation)
+clr_counts <- calc_clr(mag_species_counts_filt)
+dist_clr <- vegdist(clr_counts, method = "bray")
+plots$clr <- plot_pcoa(dist_clr, "Bray-Curtis (CLR)", metadata)
+
+# RPKM + Bray-Curtis (length-normalized)
+rpkm_tss <- norm_tss(as.matrix(mag_species_rpkm_filt))
+dist_rpkm <- vegdist(rpkm_tss, method = "bray")
+plots$rpkm <- plot_pcoa(dist_rpkm, "Bray-Curtis (RPKM)", metadata)
+
+# Relative Abundance (from CoverM) + Bray-Curtis
+relabund_mat <- as.matrix(mag_species_abund_filt)
+relabund_mat[is.na(relabund_mat)] <- 0
+dist_relabund <- vegdist(relabund_mat, method = "bray")
+plots$relabund <- plot_pcoa(dist_relabund, "Bray-Curtis (RelAbund)", metadata)
+
+# Note: TPM is not available from CoverM for MAGs
+
+# Combine plots
+library(patchwork)
+wrap_plots(plots, ncol = 3) +
+  plot_annotation(title = "Prokaryotes: Bray-Curtis PCoA Comparison")
+ggsave(file.path(OUT_DIR, "prokaryotes_bray_curtis_comparison.pdf"), width = 12, height = 10)
+```
+
+### CLR/Aitchison PCA Comparison
+
+```{r clr_pca_comparison, fig.width=12, fig.height=4}
+# CLR with different inputs
+clr_counts <- calc_clr(mag_species_counts_filt)
+clr_rpkm <- calc_clr(mag_species_rpkm_filt)
+clr_relabund <- mag_clr # Already calculated above
+
+# Helper for PCA plot
+plot_clr_pca <- function(clr_mat, title, metadata_df) {
+  pca <- prcomp(clr_mat)
+  pca_df <- as.data.frame(pca$x)
+  pca_df$SampleID <- rownames(pca_df)
+  pca_df <- left_join(pca_df, metadata_df, by = "SampleID")
+
+  var_exp <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+    geom_point(size = 3) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 10) +
+    labs(
+      title = title,
+      x = paste0("PC1 (", var_exp[1], "%)"),
+      y = paste0("PC2 (", var_exp[2], "%)")
+    ) +
+    theme(legend.position = "bottom")
+}
+
+# Create CLR plots
+p1 <- plot_clr_pca(clr_counts, "CLR (Raw Counts)", metadata)
+p2 <- plot_clr_pca(clr_rpkm, "CLR (RPKM)", metadata)
+p3 <- plot_clr_pca(clr_relabund, "CLR (Relative Abundance)", metadata)
+
+(p1 | p2 | p3) + plot_annotation(title = "Prokaryotes: CLR/Aitchison PCA Comparison")
+ggsave(file.path(OUT_DIR, "prokaryotes_clr_comparison.pdf"), width = 12, height = 4)
+```
+
+### DESeq2 Normalization
+
+```{r deseq2_plots, fig.width=10, fig.height=5}
+# Prepare count matrix for DESeq2 (features x samples, integers)
+count_mat <- t(as.matrix(mag_species_counts_filt))
+count_mat <- round(count_mat) # Ensure integers
+count_mat[count_mat < 0] <- 0
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData = metadata[colnames(count_mat), , drop = FALSE],
+  design = ~Group4
+)
+
+# VST transformation
+vst_mat <- tryCatch(
+  {
+    vst(dds, blind = TRUE)
+  },
+  error = function(e) {
+    varianceStabilizingTransformation(dds, blind = TRUE)
+  }
+)
+
+# rlog transformation (can be slow)
+rlog_mat <- tryCatch(
+  {
+    rlog(dds, blind = TRUE)
+  },
+  error = function(e) NULL
+)
+
+# PCA plots
+pca_vst <- plotPCA(vst_mat, intgroup = "Group4", returnData = TRUE)
+p_vst <- ggplot(pca_vst, aes(x = PC1, y = PC2, color = Group4)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 10) +
+  labs(title = "DESeq2 VST - PCA") +
+  theme(legend.position = "bottom")
+
+if (!is.null(rlog_mat)) {
+  pca_rlog <- plotPCA(rlog_mat, intgroup = "Group4", returnData = TRUE)
+  p_rlog <- ggplot(pca_rlog, aes(x = PC1, y = PC2, color = Group4)) +
+    geom_point(size = 3) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 10) +
+    labs(title = "DESeq2 rlog - PCA") +
+    theme(legend.position = "bottom")
+  (p_vst | p_rlog) + plot_annotation(title = "Prokaryotes: DESeq2 Normalization")
+} else {
+  p_vst + plot_annotation(title = "Prokaryotes: DESeq2 VST")
+}
+
+ggsave(file.path(OUT_DIR, "prokaryotes_deseq2_pca.pdf"), width = 10, height = 5)
+```
+
+### edgeR + NMDS
+
+```{r edger_nmds, fig.width=10, fig.height=5}
+# edgeR normalization (using explicit namespace to avoid conflicts)
+dge <- edgeR::DGEList(counts = t(as.matrix(mag_species_counts_filt)))
+dge <- edgeR::calcNormFactors(dge, method = "TMM")
+logcpm <- edgeR::cpm(dge, log = TRUE)
+
+# NMDS on TMM-normalized data
+nmds_tmm <- metaMDS(t(logcpm), distance = "euclidean", k = 2, trymax = 100, trace = 0)
+nmds_df <- as.data.frame(nmds_tmm$points)
+colnames(nmds_df) <- c("NMDS1", "NMDS2")
+nmds_df$SampleID <- rownames(nmds_df)
+nmds_df <- left_join(nmds_df, metadata, by = "SampleID")
+
+p_nmds_tmm <- ggplot(nmds_df, aes(x = NMDS1, y = NMDS2, color = Group4)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 10) +
+  labs(
+    title = paste0("edgeR TMM + NMDS (stress = ", round(nmds_tmm$stress, 3), ")"),
+    subtitle = "Euclidean distance on log-CPM"
+  ) +
+  theme(legend.position = "bottom")
+
+# NMDS on raw logCPM + Bray-Curtis
+nmds_bray <- metaMDS(t(edgeR::cpm(dge, log = FALSE)), distance = "bray", k = 2, trymax = 100, trace = 0)
+nmds_bray_df <- as.data.frame(nmds_bray$points)
+colnames(nmds_bray_df) <- c("NMDS1", "NMDS2")
+nmds_bray_df$SampleID <- rownames(nmds_bray_df)
+nmds_bray_df <- left_join(nmds_bray_df, metadata, by = "SampleID")
+
+p_nmds_bray <- ggplot(nmds_bray_df, aes(x = NMDS1, y = NMDS2, color = Group4)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 10) +
+  labs(
+    title = paste0("edgeR CPM + NMDS (stress = ", round(nmds_bray$stress, 3), ")"),
+    subtitle = "Bray-Curtis distance"
+  ) +
+  theme(legend.position = "bottom")
+
+(p_nmds_tmm | p_nmds_bray) + plot_annotation(title = "Prokaryotes: edgeR NMDS")
+ggsave(file.path(OUT_DIR, "prokaryotes_edger_nmds.pdf"), width = 10, height = 5)
+```
+
+---
+
+# 2. Viruses (vOTU-level)
+
+**Scientific Rationale:** Viruses are analyzed at the vOTU level to capture specific host-virus interactions. We normalize by genome length (RPKM) and use compositional transformations (CLR) to account for sampling depth bias.
+
+## Load Data
+
+```{r load_viruses}
+virus_cov_path <- file.path(DATA_DIR, "04_Viruses/coverage/coverm_results_viruses.tsv")
+virus_cov <- fread(virus_cov_path)
+
+# Extract RPKM columns (Length-normalized abundance)
+rpkm_cols_v <- grep("RPKM", colnames(virus_cov), value = TRUE)
+virus_rpkm_mat <- virus_cov %>%
+  dplyr::select(Contig, all_of(rpkm_cols_v)) %>%
+  column_to_rownames("Contig")
+
+# Clean column names
+colnames(virus_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(virus_rpkm_mat))
+
+# --- RENAMING SYSTEM ---
+# Rename to vOTU_0001 format for clean plotting and sorting
+virus_lookup <- data.frame(
+  Original_Name = rownames(virus_rpkm_mat),
+  New_Name = paste0("vOTU_", sprintf("%04d", 1:nrow(virus_rpkm_mat)))
+)
+
+# Apply new names
+rownames(virus_rpkm_mat) <- virus_lookup$New_Name
+
+# Save lookup for reference
+write.csv(virus_lookup, file.path(RESULTS_DIR, "virus_id_mapping.csv"), row.names = FALSE)
+cat("Renamed", nrow(virus_lookup), "vOTUs. Mapping saved to virus_id_mapping.csv\n")
+# -----------------------
+
+# Transpose to samples x features
+virus_rpkm_t <- t(virus_rpkm_mat)
+
+# Align with metadata
+common_samples_v <- intersect(rownames(virus_rpkm_t), rownames(metadata))
+virus_rpkm_t <- virus_rpkm_t[common_samples_v, , drop = FALSE]
+
+# Filter features (Remove low abundance noise)
+virus_rpkm_filt <- filter_features(virus_rpkm_t)
+
+# Convert to closed composition (Relative Abundance)
+virus_abund_filt <- sweep(virus_rpkm_filt, 1, rowSums(virus_rpkm_filt), "/")
+virus_abund_filt[is.nan(virus_abund_filt)] <- 0
+
+cat("Samples:", nrow(virus_abund_filt), "\n")
+cat("vOTUs:", ncol(virus_abund_filt), "\n")
+```
+
+## CLR and PCA
+
+```{r pca_viruses}
+virus_clr <- calc_clr(virus_abund_filt)
+virus_dist <- calc_aitchison(virus_clr)
+
+# PCA Calculation
+virus_pca <- prcomp(virus_clr)
+virus_pca_df <- as.data.frame(virus_pca$x)
+virus_pca_df$SampleID <- rownames(virus_pca_df)
+virus_pca_df <- left_join(virus_pca_df, metadata, by = "SampleID")
+
+# Variance explained
+var_explained_v <- round(100 * virus_pca$sdev^2 / sum(virus_pca$sdev^2), 1)
+
+# Standard PCA Plot (Points Only)
+p_pca_virus <- ggplot(virus_pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Viruses (vOTU) - PCA (Aitchison)",
+    x = paste0("PC1 (", var_explained_v[1], "%)"),
+    y = paste0("PC2 (", var_explained_v[2], "%)")
+  )
+print(p_pca_virus)
+ggsave(file.path(OUT_DIR, "viruses_pca_basic.pdf"), p_pca_virus, width = 6, height = 5)
+
+p_pca_virus_country <- ggplot(virus_pca_df, aes(x = PC1, y = PC2, color = Group4, shape = Country)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Viruses (vOTU) - PCA (Aitchison) + Country",
+    x = paste0("PC1 (", var_explained_v[1], "%)"),
+    y = paste0("PC2 (", var_explained_v[2], "%)")
+  )
+
+print(p_pca_virus_country)
+ggsave(file.path(OUT_DIR, "viruses_pca_country.pdf"), plot = p_pca_virus_country, width = 6, height = 5)
+```
+
+## Scaled Biplot
+
+```{r virus_biplot_scaled}
+# 1. Extract Loadings (Arrows)
+loadings <- as.data.frame(virus_pca$rotation)
+loadings$Feature <- rownames(loadings)
+
+# 2. Select Top 5 Drivers (by magnitude on PC1/PC2)
+loadings$Magnitude <- sqrt(loadings$PC1^2 + loadings$PC2^2)
+top_loadings <- loadings %>% slice_max(Magnitude, n = 5)
+
+# 3. CALCULATE SCALING FACTOR (The Critical Fix)
+# This forces arrows to fit within the range of your data points
+r_points <- max(abs(virus_pca_df$PC1), abs(virus_pca_df$PC2))
+r_arrows <- max(abs(top_loadings$PC1), abs(top_loadings$PC2))
+scale_factor <- r_points / r_arrows * 0.8 # Scale to 80% of plot size
+
+# 4. Apply Scaling
+top_loadings_scaled <- top_loadings
+top_loadings_scaled$PC1 <- top_loadings$PC1 * scale_factor
+top_loadings_scaled$PC2 <- top_loadings$PC2 * scale_factor
+
+# 5. Plot
+print(ggplot(virus_pca_df, aes(x = PC1, y = PC2)) +
+  # Points
+  geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+  # Arrows (Scaled)
+  geom_segment(
+    data = top_loadings_scaled,
+    aes(x = 0, y = 0, xend = PC1, yend = PC2),
+    arrow = arrow(length = unit(0.3, "cm")), color = "grey40"
+  ) +
+  # Labels (Scaled)
+  geom_text_repel(
+    data = top_loadings_scaled,
+    aes(x = PC1, y = PC2, label = Feature),
+    size = 4, fontface = "bold", color = "black"
+  ) +
+  scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+  scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Viruses - Biplot (Scaled)",
+    subtitle = "Arrows indicate top 5 driving vOTUs",
+    x = paste0("PC1 (", var_explained_v[1], "%)"),
+    y = paste0("PC2 (", var_explained_v[2], "%)")
+  ))
+
+ggsave(file.path(OUT_DIR, "viruses_pca_biplot_scaled.pdf"), width = 8, height = 7)
+```
+
+## PERMANOVA
+
+```{r permanova_viruses}
+meta_ordered_v <- metadata[rownames(as.matrix(virus_dist)), ]
+perm_virus <- adonis2(virus_dist ~ Group4, data = meta_ordered_v, permutations = 999)
+knitr::kable(perm_virus, caption = "PERMANOVA: Viruses (vOTU) ~ Group4")
+
+# PERMANOVA: Country * Management
+perm_virus_int <- adonis2(virus_dist ~ Country * Management, data = meta_ordered_v, permutations = 999, by = "terms")
+knitr::kable(perm_virus_int, caption = "PERMANOVA: Viruses (vOTU) ~ Country * Management")
+
+# Dispersion
+disp_virus <- calc_betadisper(virus_dist, meta_ordered_v$Group4)
+print(plot(disp_virus$mod, main = "Viruses Dispersion"))
+pdf(file.path(OUT_DIR, "viruses_dispersion.pdf"), width = 6, height = 5)
+plot(disp_virus$mod, main = "Viruses Dispersion")
+dev.off()
+knitr::kable(disp_virus$test$tab, caption = "Beta Dispersion: Viruses")
+
+# Pairwise PERMANOVA
+pair_virus <- calc_pairwise_permanova(virus_dist, meta_ordered_v$Group4)
+knitr::kable(pair_virus, digits = 4, caption = "Pairwise PERMANOVA: Viruses (BH adjusted)")
+```
+
+## Save Data
+
+```{r save_viruses}
+saveRDS(virus_abund_filt, file.path(RESULTS_DIR, "data_objects", "virus_abund_filt.rds"))
+ggsave(file.path(OUT_DIR, "viruses_pca.pdf"), width = 6, height = 5)
+
+# Scree Plot
+print(plot_pca_scree(virus_pca))
+ggsave(file.path(OUT_DIR, "viruses_pca_scree.pdf"), width = 6, height = 5)
+```
+
+---
+
+# 3. Contigs (Genus-level)
+
+## Load Taxonomy Data
+
+```{r load_contigs_taxonomy}
+contigs_dir <- file.path(DATA_DIR, "01_contigs/Taxonomy")
+contig_files <- list.files(contigs_dir, pattern = "_combined\\.tsv$", full.names = TRUE)
+
+if (length(contig_files) == 0) stop("No contig taxonomy files found in: ", contigs_dir)
+
+contigs_data_list <- lapply(contig_files, fread)
+contigs_data <- rbindlist(contigs_data_list, fill = TRUE)
+
+# Create taxonomy lookup
+# Set empty/NA genus to "Unclassified"
+contig_taxonomy <- contigs_data %>%
+  dplyr::select(contig_id, genus, sample) %>%
+  mutate(genus = ifelse(is.na(genus) | genus == "" | genus == "-" | genus == "Unknown", "Unclassified", genus)) %>%
+  distinct(contig_id, sample, .keep_all = TRUE)
+
+cat("Contigs with taxonomy:", nrow(contig_taxonomy), "\n")
+```
+
+## Load & Merge CoverM Data (Specific Recursive Fix)
+
+```{r load_merge_contigs}
+# 1. Define directory
+cov_dir <- file.path(DATA_DIR, "01_contigs/coverage/mapping_metaspades")
+
+# 2. Find the specific TSV files recursively (looking inside subfolders)
+# We look specifically for "coverm_contigs.1000.tsv"
+file_path_pattern <- "coverm_contigs\\.1000\\.tsv$"
+all_files <- list.files(cov_dir, recursive = TRUE, full.names = TRUE, pattern = file_path_pattern)
+
+cat("Found", length(all_files), "coverage files.\n")
+
+if (length(all_files) == 0) stop("No 'coverm_contigs.1000.tsv' files found! Check directory structure.")
+
+# 3. Function to read and label data based on FOLDER NAME
+read_coverm_file <- function(f) {
+  # Read the file safely
+  dt <- tryCatch(fread(f), error = function(e) NULL)
+  if (is.null(dt)) {
+    return(NULL)
+  }
+
+  # Find RPKM column (case insensitive)
+  rpkm_col <- grep("RPKM", colnames(dt), value = TRUE, ignore.case = TRUE)
+  if (length(rpkm_col) == 0) {
+    return(NULL)
+  }
+
+  # Identify Contig Column (usually column 1)
+  id_col <- colnames(dt)[1]
+
+  # Extract Data
+  dt_sub <- dt[, c(id_col, rpkm_col), with = FALSE]
+  setnames(dt_sub, id_col, "Contig")
+
+  # --- CRITICAL: Extract SampleID from Parent Folder ---
+  # Path: .../ISR_Conv1_1_contigs.1000/coverm_contigs.1000.tsv
+  # dirname: .../ISR_Conv1_1_contigs.1000
+  # basename: ISR_Conv1_1_contigs.1000
+  folder_name <- basename(dirname(f))
+
+  # Remove suffix to retrieve "ISR_Conv1_1"
+  clean_sample <- gsub("_contigs\\.1000.*", "", folder_name)
+
+  # Standardize Output
+  setnames(dt_sub, rpkm_col, "RPKM")
+  dt_sub$SampleID <- clean_sample
+
+  return(dt_sub)
+}
+
+# 4. Process all files
+cat("Reading and labeling files...\n")
+cov_list <- lapply(all_files, read_coverm_file)
+cov_list <- Filter(Negate(is.null), cov_list) # Remove failed reads
+
+if (length(cov_list) == 0) stop("No valid RPKM data extracted from any file!")
+
+# Combine into one long table (SampleID is now a column)
+contig_cov_long <- rbindlist(cov_list)
+
+cat("Successfully loaded data.\n")
+cat("Total Rows:", nrow(contig_cov_long), "\n")
+cat("Unique Samples Detected:", length(unique(contig_cov_long$SampleID)), "\n")
+```
+
+## Build Genus Composition
+
+
+```{r build_contig_rpkm_composition}
+# Validate against Metadata
+meta_samples <- rownames(metadata)
+contig_long <- contig_cov_long[SampleID %in% meta_samples]
+
+if (nrow(contig_long) == 0) {
+  cat("IDs found in files:", head(unique(contig_cov_long$SampleID)), "\n")
+  cat("IDs in Metadata:", head(meta_samples), "\n")
+  stop("Mismatch! SampleIDs derived from folders do not match Metadata.")
+}
+
+# Join with Taxonomy
+setDT(contig_taxonomy)
+setkey(contig_taxonomy, contig_id, sample)
+
+# Join on Contig AND SampleID (Self-mapping logic)
+contig_merged <- merge(contig_long, contig_taxonomy,
+  by.x = c("Contig", "SampleID"),
+  by.y = c("contig_id", "sample"),
+  all.x = TRUE
+)
+
+contig_merged[is.na(genus), genus := "Unclassified"]
+
+# Aggregate: Sum RPKM -> Calc RelAbund -> Sum Genus
+contig_merged[, total_RPKM := sum(RPKM, na.rm = TRUE), by = SampleID]
+contig_merged[, RelAbund := ifelse(total_RPKM > 0, RPKM / total_RPKM, 0)]
+
+contig_genus_abund_dt <- contig_merged[, .(Abundance = sum(RelAbund, na.rm = TRUE)), by = .(SampleID, genus)]
+
+# Reshape to Matrix (Sample x Genus)
+contig_genus_abund <- dcast(contig_genus_abund_dt, SampleID ~ genus, value.var = "Abundance", fill = 0)
+contig_genus_abund <- column_to_rownames(as.data.frame(contig_genus_abund), "SampleID")
+
+# --- FIX START: RELAXED FILTERING ---
+# Instead of 'filter_features', we just remove Genera that have 0 counts in ALL samples.
+# This keeps everything else, even rare stuff.
+contig_genus_abund_filt <- contig_genus_abund[, colSums(contig_genus_abund) > 0]
+# --- FIX END ---
+
+cat("Final Dimensions:", nrow(contig_genus_abund_filt), "Samples x", ncol(contig_genus_abund_filt), "Genera\n")
+
+# Diagnostic: Show top 5 genera to verify we have variety now
+top_5 <- head(sort(colMeans(contig_genus_abund_filt), decreasing = TRUE), 5)
+print(top_5)
+```
+## CLR and PCA
+
+```{r pca_contigs}
+# Check if we have enough data (at least 2 samples and 2 features)
+if (ncol(contig_genus_abund_filt) > 1 && nrow(contig_genus_abund_filt) > 2) {
+  contig_clr <- calc_clr(contig_genus_abund_filt)
+  contig_dist <- calc_aitchison(contig_clr)
+
+  contig_pca <- prcomp(contig_clr)
+  contig_pca_df <- as.data.frame(contig_pca$x)
+  contig_pca_df$SampleID <- rownames(contig_pca_df)
+  contig_pca_df <- left_join(contig_pca_df, metadata, by = "SampleID")
+
+  var_explained_c <- round(100 * contig_pca$sdev^2 / sum(contig_pca$sdev^2), 1)
+
+  p_pca_contig <- ggplot(contig_pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+    geom_point(size = 4) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 14) +
+    labs(
+      title = "Contigs (Genus) - PCA (Aitchison)",
+      x = paste0("PC1 (", var_explained_c[1], "%)"),
+      y = paste0("PC2 (", var_explained_c[2], "%)")
+    )
+  print(p_pca_contig)
+  ggsave(file.path(OUT_DIR, "contigs_pca_basic.pdf"), p_pca_contig, width = 6, height = 5)
+
+  p_pca_contig_country <- ggplot(contig_pca_df, aes(x = PC1, y = PC2, color = Group4, shape = Country)) +
+    geom_point(size = 4) +
+    scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+    scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = "Contigs (Genus) - PCA (Aitchison) + Country",
+      x = paste0("PC1 (", var_explained_c[1], "%)"),
+      y = paste0("PC2 (", var_explained_c[2], "%)")
+    )
+
+  print(p_pca_contig_country)
+  ggsave(file.path(OUT_DIR, "contigs_pca_country.pdf"), plot = p_pca_contig_country, width = 6, height = 5)
+} else {
+  message("Skipping Contig PCA: Not enough samples or features.")
+}
+```
+
+## PERMANOVA
+
+```{r permanova_contigs}
+if (exists("contig_dist") && nrow(as.matrix(contig_dist)) > 2) {
+  meta_ordered_c <- metadata[rownames(as.matrix(contig_dist)), ]
+
+  if (length(unique(meta_ordered_c$Group4)) > 1) {
+    perm_contig <- adonis2(contig_dist ~ Group4, data = meta_ordered_c, permutations = 999)
+    knitr::kable(perm_contig, caption = "PERMANOVA: Contigs ~ Group4")
+
+    # PERMANOVA: Country * Management
+    perm_contig_int <- adonis2(contig_dist ~ Country * Management, data = meta_ordered_c, permutations = 999, by = "terms")
+    knitr::kable(perm_contig_int, caption = "PERMANOVA: Contigs ~ Country * Management")
+
+    # Dispersion
+    disp_contig <- calc_betadisper(contig_dist, meta_ordered_c$Group4)
+    print(plot(disp_contig$mod, main = "Contigs Dispersion"))
+    pdf(file.path(OUT_DIR, "contigs_dispersion.pdf"), width = 6, height = 5)
+    plot(disp_contig$mod, main = "Contigs Dispersion")
+    dev.off()
+  } else {
+    message("Cannot run PERMANOVA: Only 1 group present.")
+  }
+}
+```
+## Scaled Biplot (Contigs)
+
+```{r contigs_biplot_scaled}
+# Only run if PCA exists and we have enough features
+if (exists("contig_pca") && ncol(contig_pca$rotation) > 0) {
+  # 1. Extract Loadings (The "Arrows")
+  loadings_c <- as.data.frame(contig_pca$rotation)
+  loadings_c$Feature <- rownames(loadings_c)
+
+  # 2. Select Top 5 Drivers (by magnitude on PC1/PC2)
+  loadings_c$Magnitude <- sqrt(loadings_c$PC1^2 + loadings_c$PC2^2)
+  top_loadings_c <- loadings_c %>% slice_max(Magnitude, n = 5)
+
+  # 3. CALCULATE SCALING FACTOR
+  # Get the range of the data points
+  r_points <- max(abs(contig_pca_df$PC1), abs(contig_pca_df$PC2))
+  # Get the range of the arrow vectors
+  r_arrows <- max(abs(top_loadings_c$PC1), abs(top_loadings_c$PC2))
+  # Scale arrows to take up ~80% of the plot space
+  scale_factor_c <- r_points / r_arrows * 0.8
+
+  # 4. Apply Scaling to the Top 5 Arrows
+  top_loadings_scaled_c <- top_loadings_c
+  top_loadings_scaled_c$PC1 <- top_loadings_c$PC1 * scale_factor_c
+  top_loadings_scaled_c$PC2 <- top_loadings_c$PC2 * scale_factor_c
+
+  # 5. Plot
+  print(ggplot(contig_pca_df, aes(x = PC1, y = PC2)) +
+    # Plot the Samples (Dots)
+    geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+
+    # Plot the Arrows (Scaled)
+    geom_segment(
+      data = top_loadings_scaled_c,
+      aes(x = 0, y = 0, xend = PC1, yend = PC2),
+      arrow = arrow(length = unit(0.3, "cm")), color = "grey40"
+    ) +
+
+    # Plot the Labels (Scaled)
+    geom_text_repel(
+      data = top_loadings_scaled_c,
+      aes(x = PC1, y = PC2, label = Feature),
+      size = 4, fontface = "bold", color = "black",
+      box.padding = 0.5
+    ) +
+    scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+    scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = "Contigs (Genus) - Biplot",
+      subtitle = "Arrows indicate top 5 driving Genera",
+      x = paste0("PC1 (", var_explained_c[1], "%)"),
+      y = paste0("PC2 (", var_explained_c[2], "%)")
+    ))
+
+  ggsave(file.path(OUT_DIR, "contigs_pca_biplot.pdf"), width = 8, height = 7)
+}
+```
+
+## Community Composition Bar Plot
+
+```{r contigs_composition_barplot}
+if (exists("contig_genus_abund_filt") && ncol(contig_genus_abund_filt) > 0) {
+  rel_ab <- as.matrix(contig_genus_abund_filt)
+  mean_ab <- colMeans(rel_ab)
+
+  # Top 10 genera + "Other"
+  top_n <- min(12, length(mean_ab))
+  top_genera <- names(sort(mean_ab, decreasing = TRUE)[1:top_n])
+
+  plot_df <- as.data.frame(rel_ab) %>%
+    rownames_to_column("SampleID") %>%
+    pivot_longer(-SampleID, names_to = "Genus", values_to = "RelAbund") %>%
+    mutate(Genus = ifelse(Genus %in% top_genera, Genus, "Other")) %>%
+    group_by(SampleID, Genus) %>%
+    summarise(RelAbund = sum(RelAbund), .groups = "drop") %>%
+    left_join(metadata, by = "SampleID")
+
+  # Order genera
+  genus_order <- c(top_genera, "Other")
+  plot_df$Genus <- factor(plot_df$Genus, levels = rev(genus_order))
+
+  # Safe Colors
+  if (top_n > 12) {
+    pal_colors <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(top_n)
+  } else {
+    pal_colors <- RColorBrewer::brewer.pal(top_n, "Set3")
+  }
+
+  print(ggplot(plot_df, aes(x = SampleID, y = RelAbund, fill = Genus)) +
+    geom_bar(stat = "identity") +
+    facet_grid(~Group4, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = c("grey70", pal_colors)) +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+    labs(
+      title = "Contig Community Composition (Genus Level)",
+      x = "Sample", y = "Relative Abundance", fill = "Genus"
+    ))
+
+  ggsave(file.path(OUT_DIR, "contigs_community_barplot.pdf"), width = 12, height = 6)
+}
+```
+
+## Save Data
+
+```{r save_contigs}
+if (exists("contig_genus_abund_filt") && ncol(contig_genus_abund_filt) > 0) {
+  saveRDS(contig_genus_abund_filt, file.path(RESULTS_DIR, "data_objects", "contig_genus_abund_filt.rds"))
+
+  if (exists("contig_pca")) {
+    ggsave(file.path(OUT_DIR, "contigs_pca.pdf"), width = 6, height = 5)
+  }
+}
+```
+
+---
+
+# 4. Plasmids (pOTU-level)
+
+**Scientific Rationale:** Similar to viruses, plasmids are mobile genetic elements. Grouping them by "predicted host" can obscure their diversity and mobility. Therefore, we analyze plasmids at the **pOTU level** (Plasmid Operational Taxonomic Units), identifying specific plasmid populations regardless of their current host.
+
+## Load Data
+
+```{r load_plasmids}
+plasmid_cov_path <- file.path(DATA_DIR, "03_Plasmids/coverage/coverm_results_plasmids.tsv")
+plasmid_cov <- fread(plasmid_cov_path)
+
+# Extract RPKM columns
+rpkm_cols_p <- grep("RPKM", colnames(plasmid_cov), value = TRUE)
+plasmid_rpkm_mat <- plasmid_cov %>%
+  dplyr::select(Contig, all_of(rpkm_cols_p)) %>%
+  column_to_rownames("Contig")
+
+# Clean column names
+colnames(plasmid_rpkm_mat) <- gsub("\\.sorted RPKM", "", colnames(plasmid_rpkm_mat))
+
+# --- RENAMING SYSTEM ---
+# Create lookup table with zero-padding
+plasmid_lookup <- data.frame(
+  Original_Name = rownames(plasmid_rpkm_mat),
+  New_Name = paste0("pOTU_", sprintf("%04d", 1:nrow(plasmid_rpkm_mat)))
+)
+
+# Apply new names
+rownames(plasmid_rpkm_mat) <- plasmid_lookup$New_Name
+
+# Save lookup
+write.csv(plasmid_lookup, file.path(RESULTS_DIR, "plasmid_id_mapping.csv"), row.names = FALSE)
+cat("Renamed", nrow(plasmid_lookup), "pOTUs. Mapping saved to plasmid_id_mapping.csv\n")
+# -----------------------
+
+# Transpose to samples x plasmids
+plasmid_rpkm_t <- t(plasmid_rpkm_mat)
+
+# Align with metadata
+common_samples_p <- intersect(rownames(plasmid_rpkm_t), rownames(metadata))
+plasmid_rpkm_t <- plasmid_rpkm_t[common_samples_p, , drop = FALSE]
+
+# Filter features
+plasmid_rpkm_filt <- filter_features(plasmid_rpkm_t)
+
+# Convert to closed composition
+plasmid_abund_filt <- sweep(plasmid_rpkm_filt, 1, rowSums(plasmid_rpkm_filt), "/")
+plasmid_abund_filt[is.nan(plasmid_abund_filt)] <- 0
+
+cat("Samples:", nrow(plasmid_abund_filt), "\n")
+cat("pOTUs:", ncol(plasmid_abund_filt), "\n")
+```
+
+## CLR and PCA
+
+```{r pca_plasmids}
+if (ncol(plasmid_abund_filt) >= 3) {
+  plasmid_clr <- calc_clr(plasmid_abund_filt)
+  plasmid_dist <- calc_aitchison(plasmid_clr)
+
+  plasmid_pca <- prcomp(plasmid_clr)
+  plasmid_pca_df <- as.data.frame(plasmid_pca$x)
+  plasmid_pca_df$SampleID <- rownames(plasmid_pca_df)
+  plasmid_pca_df <- left_join(plasmid_pca_df, metadata, by = "SampleID")
+
+  var_explained_p <- round(100 * plasmid_pca$sdev^2 / sum(plasmid_pca$sdev^2), 1)
+
+  p_pca_plasmid <- ggplot(plasmid_pca_df, aes(x = PC1, y = PC2, color = Group4)) +
+    geom_point(size = 4) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 14) +
+    labs(
+      title = "Plasmids (pOTU) - PCA (Aitchison)",
+      x = paste0("PC1 (", var_explained_p[1], "%)"),
+      y = paste0("PC2 (", var_explained_p[2], "%)")
+    )
+  print(p_pca_plasmid)
+  ggsave(file.path(OUT_DIR, "plasmids_potu_pca_basic.pdf"), p_pca_plasmid, width = 6, height = 5)
+
+  p_pca_plasmid_country <- ggplot(plasmid_pca_df, aes(x = PC1, y = PC2, color = Group4, shape = Country)) +
+    geom_point(size = 4) +
+    scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+    scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = "Plasmids (pOTU) - PCA (Aitchison) + Country",
+      x = paste0("PC1 (", var_explained_p[1], "%)"),
+      y = paste0("PC2 (", var_explained_p[2], "%)")
+    )
+
+  print(p_pca_plasmid_country)
+  ggsave(file.path(OUT_DIR, "plasmids_potu_pca_country.pdf"), plot = p_pca_plasmid_country, width = 6, height = 5)
+} else {
+  message("Insufficient data for plasmid PCA")
+}
+```
+
+## PERMANOVA
+
+```{r permanova_plasmids}
+if (exists("plasmid_dist")) {
+  meta_ordered_p <- metadata[rownames(as.matrix(plasmid_dist)), ]
+  perm_plasmid <- adonis2(plasmid_dist ~ Group4, data = meta_ordered_p, permutations = 999)
+  knitr::kable(perm_plasmid, caption = "PERMANOVA: Plasmids (pOTU) ~ Group4")
+
+  # PERMANOVA: Country * Management
+  perm_plasmid_int <- adonis2(plasmid_dist ~ Country * Management, data = meta_ordered_p, permutations = 999, by = "terms")
+  knitr::kable(perm_plasmid_int, caption = "PERMANOVA: Plasmids (pOTU) ~ Country * Management")
+
+  # Dispersion
+  disp_plasmid <- calc_betadisper(plasmid_dist, meta_ordered_p$Group4)
+  print(plot(disp_plasmid$mod, main = "Plasmids Dispersion"))
+  pdf(file.path(OUT_DIR, "plasmids_dispersion.pdf"), width = 6, height = 5)
+  plot(disp_plasmid$mod, main = "Plasmids Dispersion")
+  dev.off()
+  knitr::kable(disp_plasmid$test$tab, caption = "Beta Dispersion: Plasmids")
+
+  # Pairwise
+  pair_plasmid <- calc_pairwise_permanova(plasmid_dist, meta_ordered_p$Group4)
+  knitr::kable(pair_plasmid, digits = 4, caption = "Pairwise: Plasmids")
+}
+```
+
+## Save Data
+
+```{r save_plasmids}
+saveRDS(plasmid_abund_filt, file.path(RESULTS_DIR, "data_objects", "plasmid_abund_filt.rds"))
+if (exists("plasmid_pca")) {
+  ggsave(file.path(OUT_DIR, "plasmids_potu_pca.pdf"), width = 6, height = 5)
+  # Biplot (Manual for Custom Style)
+  library(ggrepel)
+  loadings_p <- as.data.frame(plasmid_pca$rotation)
+  loadings_p$Feature <- rownames(loadings_p)
+  loadings_p$Magnitude <- sqrt(loadings_p$PC1^2 + loadings_p$PC2^2)
+  top_loadings_p <- loadings_p %>% slice_max(Magnitude, n = 5)
+
+  r_points <- max(abs(plasmid_pca_df$PC1), abs(plasmid_pca_df$PC2))
+  r_arrows <- max(abs(top_loadings_p$PC1), abs(top_loadings_p$PC2))
+  scale_factor_p <- r_points / r_arrows * 0.8
+
+  top_loadings_p$PC1 <- top_loadings_p$PC1 * scale_factor_p
+  top_loadings_p$PC2 <- top_loadings_p$PC2 * scale_factor_p
+
+  p_biplot_plasmid <- ggplot(plasmid_pca_df, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+    geom_segment(data = top_loadings_p, aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.3, "cm")), color = "grey40") +
+    geom_text_repel(data = top_loadings_p, aes(x = PC1, y = PC2, label = Feature), size = 4, fontface = "bold", color = "black") +
+    scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+    scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+    theme_bw(base_size = 14) +
+    labs(title = "Plasmids (pOTU) - Biplot", x = paste0("PC1 (", var_explained_p[1], "%)"), y = paste0("PC2 (", var_explained_p[2], "%)"))
+
+  print(p_biplot_plasmid)
+  ggsave(file.path(OUT_DIR, "plasmids_potu_pca_biplot.pdf"), plot = p_biplot_plasmid, width = 7, height = 6)
+  print(plot_pca_scree(plasmid_pca))
+  ggsave(file.path(OUT_DIR, "plasmids_potu_pca_scree.pdf"), width = 6, height = 5)
+}
+```
+
+
+# 5. Combined Visualization
+
+## Generate Grid of Biplots
+
+```{r combined_biplots, fig.width=14, fig.height=12}
+library(cowplot)
+library(ggrepel)
+
+# Helper function to create a consistently scaled biplot
+create_scaled_biplot <- function(pca_obj, pca_df, title_text, var_explained) {
+  # Safety Check
+  if (is.null(pca_obj) || is.null(pca_df)) {
+    return(ggplot() +
+      theme_void() +
+      labs(title = paste(title_text, "(Insufficient Data)")))
+  }
+
+  # 1. Extract and Scale Loadings
+  loadings <- as.data.frame(pca_obj$rotation)
+  loadings$Feature <- rownames(loadings)
+  loadings$Magnitude <- sqrt(loadings$PC1^2 + loadings$PC2^2)
+  top_loadings <- loadings %>% slice_max(Magnitude, n = 5)
+
+  r_points <- max(abs(pca_df$PC1), abs(pca_df$PC2))
+  r_arrows <- max(abs(top_loadings$PC1), abs(top_loadings$PC2))
+  scale_factor <- r_points / r_arrows * 0.8
+
+  top_loadings$PC1 <- top_loadings$PC1 * scale_factor
+  top_loadings$PC2 <- top_loadings$PC2 * scale_factor
+
+  # 2. Plot
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = Group4, shape = Country), size = 3, alpha = 0.8) +
+    geom_segment(
+      data = top_loadings, aes(x = 0, y = 0, xend = PC1, yend = PC2),
+      arrow = arrow(length = unit(0.2, "cm")), color = "grey40"
+    ) +
+    geom_text_repel(
+      data = top_loadings, aes(x = PC1, y = PC2, label = Feature),
+      size = 3, fontface = "bold", color = "black", box.padding = 0.4
+    ) +
+    scale_color_manual(values = group4_colors, name = "Management", labels = function(x) gsub("_", ": ", x)) +
+    scale_shape_manual(values = c("ISR" = 16, "USA" = 17), name = "Region") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none") + # Hide legend for individual plots
+    labs(
+      title = title_text,
+      x = paste0("PC1 (", var_explained[1], "%)"),
+      y = paste0("PC2 (", var_explained[2], "%)")
+    )
+
+  return(p)
+}
+
+# --- Generate the 4 Plots ---
+
+# 1. Prokaryotes (MAGs)
+# Recalculate var explained if needed, or grab from previous chunks
+var_mag <- round(100 * mag_pca$sdev^2 / sum(mag_pca$sdev^2), 1)
+p_mag <- create_scaled_biplot(mag_pca, mag_pca_df, "A. Prokaryotes (Species)", var_mag)
+
+# 2. Viruses (vOTUs)
+var_vir <- round(100 * virus_pca$sdev^2 / sum(virus_pca$sdev^2), 1)
+p_vir <- create_scaled_biplot(virus_pca, virus_pca_df, "B. Viruses (vOTU)", var_vir)
+
+# 3. Contigs (Genera)
+# Check existence first (in case Section 3 was skipped)
+if (exists("contig_pca") && exists("contig_pca_df")) {
+  var_contig <- round(100 * contig_pca$sdev^2 / sum(contig_pca$sdev^2), 1)
+  p_contig <- create_scaled_biplot(contig_pca, contig_pca_df, "C. Contigs (Genus)", var_contig)
+} else {
+  p_contig <- ggplot() +
+    theme_void() +
+    labs(title = "C. Contigs (No Data)")
+}
+
+# 4. Plasmids (pOTUs)
+if (exists("plasmid_pca") && exists("plasmid_pca_df")) {
+  var_plas <- round(100 * plasmid_pca$sdev^2 / sum(plasmid_pca$sdev^2), 1)
+  p_plas <- create_scaled_biplot(plasmid_pca, plasmid_pca_df, "D. Plasmids (pOTU)", var_plas)
+} else {
+  p_plas <- ggplot() +
+    theme_void() +
+    labs(title = "D. Plasmids (No Data)")
+}
+
+# --- Combine and Add Legend ---
+
+# Extract legend from one plot
+legend <- get_legend(
+  p_mag + theme(legend.position = "bottom", legend.title = element_text(face = "bold"))
+)
+
+# Arrange the 4 plots
+plots_grid <- plot_grid(p_mag, p_vir, p_contig, p_plas, ncol = 2, align = "hv")
+
+# Add legend at the bottom
+final_grid <- plot_grid(plots_grid, legend, ncol = 1, rel_heights = c(1, 0.1))
+
+print(final_grid)
+
+ggsave(file.path(OUT_DIR, "combined_biplot_grid.pdf"), final_grid, width = 14, height = 12)
+```
+
+# 6. Community Concordance (Beta Diversity)
+
+This section evaluates the concordance between different genomic compartments using two statistical approaches:
+1. **Mantel Test**: Correlations between distance matrices (Aitchison distance).
+2. **Procrustes Analysis**: Alignment of ordination configurations (PCA).
+
+```{r concordance_analysis}
+# Define Helper Function for Pairwise Tests
+align_and_test <- function(dist1, dist2, name1, name2) {
+  # 1. Align Samples (Intersection)
+  samples <- intersect(rownames(as.matrix(dist1)), rownames(as.matrix(dist2)))
+
+  if (length(samples) < 5) {
+    return(NULL)
+  }
+
+  # Subset distance matrices
+  d1 <- as.dist(as.matrix(dist1)[samples, samples])
+  d2 <- as.dist(as.matrix(dist2)[samples, samples])
+
+  # 2. Mantel Test (Correlation of Distances)
+  mantel_res <- vegan::mantel(d1, d2, method = "pearson", permutations = 999)
+
+  # 3. Procrustes Test (Alignment of Ordination)
+  # We perform PCoA (cmdscale) on the aligned distances for Procrustes input
+  pcoa1 <- cmdscale(d1, k = 2)
+  pcoa2 <- cmdscale(d2, k = 2)
+  protest_res <- vegan::protest(pcoa1, pcoa2, permutations = 999)
+
+  # Return Summary
+  # Note: Procrustes correlation is roughly sqrt(1 - SS), but protest returns 't0' which is correlation
+  return(data.frame(
+    Comparison = paste(name1, "vs", name2),
+    N_Samples = length(samples),
+    Mantel_r = mantel_res$statistic,
+    Mantel_p = mantel_res$signif,
+    Procrustes_Corr = protest_res$t0,
+    Procrustes_p = protest_res$signif
+  ))
+}
+
+# Define List of Distance Matrices
+dist_list <- list()
+if (exists("read_dist")) dist_list[["Reads"]] <- read_dist
+if (exists("mag_dist")) dist_list[["Prokaryotes"]] <- mag_dist
+if (exists("virus_dist")) dist_list[["Viruses"]] <- virus_dist
+if (exists("contig_dist")) dist_list[["Contigs"]] <- contig_dist
+if (exists("plasmid_dist")) dist_list[["Plasmids"]] <- plasmid_dist
+
+# Run Pairwise Comparisons
+concordance_results <- data.frame()
+dist_names <- names(dist_list)
+
+if (length(dist_names) >= 2) {
+  for (i in 1:(length(dist_names) - 1)) {
+    for (j in (i + 1):length(dist_names)) {
+      name1 <- dist_names[i]
+      name2 <- dist_names[j]
+
+      res <- align_and_test(dist_list[[name1]], dist_list[[name2]], name1, name2)
+      if (!is.null(res)) {
+        concordance_results <- rbind(concordance_results, res)
+      }
+    }
+  }
+}
+
+# Display Results
+if (nrow(concordance_results) > 0) {
+  concordance_results <- concordance_results %>%
+    mutate(
+      Mantel_r = round(Mantel_r, 3),
+      Mantel_p = scales::pvalue(Mantel_p),
+      Procrustes_Corr = round(Procrustes_Corr, 3),
+      Procrustes_p = scales::pvalue(Procrustes_p)
+    )
+
+  knitr::kable(concordance_results, caption = "Community Concordance: Mantel & Procrustes Tests")
+  write.csv(concordance_results, file.path(OUT_DIR, "concordance_stats.csv"), row.names = FALSE)
+} else {
+  print("Insufficient data for concordance analysis.")
+}
+```
+
+# 7. Statistical Summary
+
+This section aggregates the key statistics (R², P-value) from the PERMANOVA models testing `Country * Management` across all domains.
+
+```{r statistical_summary}
+summary_list <- list()
+
+# Function to extract rows from adonis2 result
+get_stats <- function(obj, name) {
+  df <- as.data.frame(obj)
+
+  # Get all row names
+  all_rows <- rownames(df)
+
+  # Filter out Residuals and Total to keep only model terms
+  keep <- all_rows[!all_rows %in% c("Residual", "Residuals", "Total")]
+
+  if (length(keep) == 0) {
+    warning(paste("No model terms found in PERMANOVA object for", name))
+    return(NULL)
+  }
+
+  # Extract cols
+  cols_needed <- c("R2", "Pr(>F)")
+  if (!all(cols_needed %in% colnames(df))) {
+    return(NULL)
+  }
+
+  out <- df[keep, cols_needed, drop = FALSE]
+  colnames(out) <- c("R2", "P_value")
+  out$Term <- keep
+  out$Domain <- name
+  return(out)
+}
+
+# Function to extract dispersion p-value
+get_disp <- function(obj, name) {
+  # obj is result of calc_betadisper -> list(mod, test)
+  if (is.null(obj) || is.null(obj$test)) {
+    return(NULL)
+  }
+
+  # permutest object has a table called 'tab'
+  tab <- as.data.frame(obj$test$tab)
+  p_val <- tab$`Pr(>F)`[1] # First row is usually the test
+
+  out <- data.frame(
+    R2 = NA, # Dispersion doesn't have R2 in the same sense
+    P_value = p_val,
+    Term = "Dispersion (Check)",
+    Domain = name
+  )
+  return(out)
+}
+
+# Reads
+if (exists("perm_read_int") && !is.null(perm_read_int)) {
+  res <- get_stats(perm_read_int, "Reads (Genus)")
+  if (!is.null(res)) summary_list[[length(summary_list) + 1]] <- res
+}
+if (exists("disp_read") && !is.null(disp_read)) {
+  summary_list[[length(summary_list) + 1]] <- get_disp(disp_read, "Reads (Genus)")
+}
+
+# Prokaryotes
+if (exists("perm_mag_int") && !is.null(perm_mag_int)) {
+  res <- get_stats(perm_mag_int, "Prokaryotes (Species)")
+  if (!is.null(res)) summary_list[[length(summary_list) + 1]] <- res
+}
+if (exists("disp_mag") && !is.null(disp_mag)) {
+  summary_list[[length(summary_list) + 1]] <- get_disp(disp_mag, "Prokaryotes (Species)")
+}
+
+# Viruses
+if (exists("perm_virus_int") && !is.null(perm_virus_int)) {
+  res <- get_stats(perm_virus_int, "Viruses (vOTU)")
+  if (!is.null(res)) summary_list[[length(summary_list) + 1]] <- res
+}
+if (exists("disp_virus") && !is.null(disp_virus)) {
+  summary_list[[length(summary_list) + 1]] <- get_disp(disp_virus, "Viruses (vOTU)")
+}
+
+# Contigs
+if (exists("perm_contig_int") && !is.null(perm_contig_int)) {
+  res <- get_stats(perm_contig_int, "Contigs (Genus)")
+  if (!is.null(res)) summary_list[[length(summary_list) + 1]] <- res
+}
+if (exists("disp_contig") && !is.null(disp_contig)) {
+  summary_list[[length(summary_list) + 1]] <- get_disp(disp_contig, "Contigs (Genus)")
+}
+
+# Plasmids
+if (exists("perm_plasmid_int") && !is.null(perm_plasmid_int)) {
+  res <- get_stats(perm_plasmid_int, "Plasmids (pOTU)")
+  if (!is.null(res)) summary_list[[length(summary_list) + 1]] <- res
+}
+if (exists("disp_plasmid") && !is.null(disp_plasmid)) {
+  summary_list[[length(summary_list) + 1]] <- get_disp(disp_plasmid, "Plasmids (pOTU)")
+}
+
+# Combine and Display
+if (length(summary_list) > 0) {
+  final_stats <- do.call(rbind, summary_list)
+
+  # Formatting
+  final_stats_view <- final_stats %>%
+    dplyr::select(Domain, Term, R2, P_value) %>%
+    dplyr::mutate(
+      R2 = ifelse(is.na(R2), "-", as.character(round(R2, 3))),
+      Significance = case_when(
+        P_value <= 0.001 ~ "***",
+        P_value <= 0.01 ~ "**",
+        P_value <= 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      P_value = scales::pvalue(P_value) # Nice p-value formatting
+    )
+
+  knitr::kable(final_stats_view, caption = "Detailed Summary: PERMANOVA & Dispersion Checks (Aitchison Distance)")
+
+  # Save to CSV
+  write.csv(final_stats, file.path(OUT_DIR, "permanova_summary_combined.csv"), row.names = FALSE)
+} else {
+  print("No stats available.")
+}
+```
+
+
+---
+
+# 7. Summary Visualization
+
+This section creates a clean, faceted PCA plot comparing the community structure across all four major genomic entities.
+
+```{r summary_pca_plot, fig.width=12, fig.height=10}
+
+# Define domain levels once (avoid silent mismatches)
+domain_levels <- c(
+  "MAGs (Species)",
+  "Viruses (vOTU)",
+  "Contigs (Genus)",
+  "Plasmids (pOTU)"
+)
+
+# Combine all PCA dataframes into one for plotting
+pca_list <- list()
+
+if (exists("mag_pca_df")) {
+  df <- mag_pca_df %>%
+    dplyr::select(SampleID, PC1, PC2, Group4, Country, Management) %>%
+    dplyr::mutate(Domain = "MAGs (Species)")
+  pca_list[[length(pca_list) + 1]] <- df
+}
+
+if (exists("virus_pca_df")) {
+  df <- virus_pca_df %>%
+    dplyr::select(SampleID, PC1, PC2, Group4, Country, Management) %>%
+    dplyr::mutate(Domain = "Viruses (vOTU)")
+  pca_list[[length(pca_list) + 1]] <- df
+}
+
+if (exists("contig_pca_df")) {
+  df <- contig_pca_df %>%
+    dplyr::select(SampleID, PC1, PC2, Group4, Country, Management) %>%
+    dplyr::mutate(Domain = "Contigs (Genus)")
+  pca_list[[length(pca_list) + 1]] <- df
+}
+
+if (exists("plasmid_pca_df")) {
+  df <- plasmid_pca_df %>%
+    dplyr::select(SampleID, PC1, PC2, Group4, Country, Management) %>%
+    dplyr::mutate(Domain = "Plasmids (pOTU)")
+  pca_list[[length(pca_list) + 1]] <- df
+}
+
+if (length(pca_list) > 0) {
+
+  combined_pca <- dplyr::bind_rows(pca_list)
+
+  # Ensure consistent factor order
+  combined_pca$Domain <- factor(combined_pca$Domain, levels = domain_levels)
+
+  # Create the plot
+  p_summary <- ggplot(combined_pca, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = Group4, shape = Country), size = 4, alpha = 0.8) +
+    scale_color_manual(
+      values = group4_colors,
+      name = "Management",
+      labels = function(x) gsub("_", ": ", x)
+    ) +
+    scale_shape_manual(
+      values = c("ISR" = 16, "USA" = 17),
+      name = "Region"
+    ) +
+    facet_wrap(~Domain, scales = "free") +
+    theme_bw(base_size = 14) +
+    theme(
+      strip.background = element_rect(fill = "grey90"),
+      strip.text = element_text(face = "bold", size = 12),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = "Community Composition Summary",
+      subtitle = "PCA (Aitchison Distance) across Genomic Domains",
+      x = "PC1",
+      y = "PC2"
+    )
+
+  print(p_summary)
+
+  ggsave(
+    file.path(OUT_DIR, "summary_pca_grid.pdf"),
+    p_summary,
+    width = 12,
+    height = 10
+  )
+
+} else {
+  print("No PCA data available for summary plot.")
+}
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

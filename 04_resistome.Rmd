@@ -1,0 +1,1731 @@
+---
+title: "04 - Resistome Analysis"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6)
+```
+
+# Q4: Resistome Load, Diversity, and Composition
+
+**Analysis Overview:**
+
+| Phase | Description |
+|-------|-------------|
+| 1 | Load & Build ARG Matrices (all domains) |
+| 2 | ARG Load Comparison |
+| 3 | Alpha Diversity (Hill Numbers) |
+| 4 | Beta Diversity (PCA + PERMANOVA) |
+| 5 | Differential Abundance (ALDEx2) |
+| 6 | Integration & Visualization |
+
+---
+
+# Setup
+
+```{r load_setup}
+source("/media/Box/applesurface_management/00_Data_antigravity/scripts/00_setup.R")
+library(ggrepel)
+
+OUT_DIR <- file.path(RESULTS_DIR, "04_resistome")
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+
+GE_DIR <- file.path(DATA_DIR, "00_reads/Genome_Equivalents_Summary")
+GE_SUMMARY_FILE <- file.path(GE_DIR, "ge_summary.csv")
+
+# Load GE Data Globally
+if (file.exists(GE_SUMMARY_FILE)) {
+  ge_df <- read.csv(GE_SUMMARY_FILE, stringsAsFactors = FALSE)
+  # Standardize sample names if necessary? (e.g. they align with filenames)
+} else {
+  ge_df <- NULL
+  warning("GE Summary file not found!")
+}
+```
+
+---
+---
+
+# Phase 1: Load & Build ARG Matrices
+
+## 1.1 Helper Functions
+
+```{r helpers}
+# CLR transformation with zero imputation
+calc_clr <- function(mat) {
+  mat_z <- zCompositions::cmultRepl(mat, method = "CZM", output = "p-counts")
+  t(apply(log(mat_z), 1, function(x) x - mean(x)))
+}
+
+# Aitchison distance from CLR (Euclidean distance in CLR space)
+calc_aitchison <- function(clr_mat) {
+  vegan::vegdist(clr_mat, method = "euclidean")
+}
+
+# Filter low-abundance features
+filter_features <- function(mat, min_prevalence = 0.1, min_count = 1) {
+  prevalence <- colSums(mat > 0) / nrow(mat)
+  mat[, prevalence >= min_prevalence, drop = FALSE]
+}
+
+# Hill numbers
+calc_hill <- function(mat) {
+  mat_filt <- mat[, colSums(mat) > 0, drop = FALSE]
+  if (ncol(mat_filt) == 0) {
+    return(NULL)
+  }
+
+  rel <- prop.table(as.matrix(mat_filt), 1)
+  q0 <- rowSums(rel > 0)
+  q1 <- exp(vegan::diversity(rel, index = "shannon"))
+  simp <- vegan::diversity(rel, index = "simpson")
+  q2 <- ifelse(simp == 0, 0, 1 / simp)
+
+  data.frame(SampleID = rownames(mat), q0 = q0, q1 = q1, q2 = q2)
+}
+
+# Read raw ARG files and build matrices
+# Read Genome Equivalents
+# Read Genome Equivalents and Read Length
+# Read Genome Equivalents (Look up in loaded dataframe)
+get_genome_equivalents <- function(sample_name, ge_data = ge_df) {
+  if (is.null(ge_data)) {
+    return(NULL)
+  }
+
+  # Try exact match
+  row <- ge_data[ge_data$SampleID == sample_name, ]
+  if (nrow(row) == 0) {
+    return(NULL)
+  }
+
+  # Return formatting matching previous output
+  return(list(ge = row$Genome_Equivalents, rl = row$Read_Length))
+}
+
+# Read raw ARG files and build matrices (Raw Counts + RPKG)
+# Read raw ARG files and build matrices (Raw Counts + RPKG)
+read_arg_domain <- function(file_dir, pattern, sample_extractor, ge_data = ge_df) {
+  files <- list.files(file_dir, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) {
+    return(list(class_raw = NULL, class_rpkg = NULL, mech_raw = NULL, mech_rpkg = NULL))
+  }
+
+  class_list_raw <- list()
+  class_list_rpkg <- list()
+  mech_list_raw <- list()
+  mech_list_rpkg <- list()
+
+  for (f in files) {
+    dt <- tryCatch(read.delim(f, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (is.null(dt) || nrow(dt) == 0) next
+
+    sample_name <- sample_extractor(basename(f))
+
+    # Get Genome Equivalents
+    ge_info <- get_genome_equivalents(sample_name, ge_data)
+
+    # Check for coverage in read_id (SPAdes format: cov_X)
+    # If not found or GE missing, RPKG will be NA (or simple Count/GE?)
+    # RPKG formula: (Coverage * 1000) / (ReadLength * GE)
+    # If Coverage missing, assume 1? (Not ideal).
+    dt$coverage <- as.numeric(str_extract(dt$read_id, "(?<=cov_)[0-9.]+"))
+
+    if (!is.null(ge_info) && !all(is.na(dt$coverage))) {
+      # Calculate RPKG per hit
+      # If coverage is NA (some contigs), use 1? Or drop? Use 1 for safety.
+      cov_vals <- dt$coverage
+      cov_vals[is.na(cov_vals)] <- 1
+      dt$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+    } else {
+      # Fallback if GE or Cov missing: RPKG = Count (bad but prevents crash)
+      dt$RPKG <- 1 # Assuming Count=1 per line
+      if (is.null(ge_info)) warning(paste("Missing GE for", sample_name))
+    }
+
+    # Find class column
+    class_col <- intersect(colnames(dt), c("predicted_ARG.class", "predicted_ARG_class", "drug_class"))
+
+    # Class Aggregation
+    if (length(class_col) > 0) {
+      class_col <- class_col[1]
+      dt$ARG_Class_Use <- dt[[class_col]]
+
+      # Raw Counts
+      counts_raw <- dt %>%
+        group_by(ARG_Class_Use) %>%
+        summarise(Count = n(), .groups = "drop") %>%
+        mutate(SampleID = sample_name)
+      class_list_raw[[length(class_list_raw) + 1]] <- counts_raw
+
+      # RPKG
+      counts_rpkg <- dt %>%
+        group_by(ARG_Class_Use) %>%
+        summarise(Count = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+        mutate(SampleID = sample_name)
+      class_list_rpkg[[length(class_list_rpkg) + 1]] <- counts_rpkg
+    }
+
+    # Mechanism Aggregation
+    if ("resistance_mechanism" %in% colnames(dt) && any(!is.na(dt$resistance_mechanism))) {
+      # Raw Counts
+      mech_raw <- dt %>%
+        filter(!is.na(resistance_mechanism) & resistance_mechanism != "") %>%
+        group_by(resistance_mechanism) %>%
+        summarise(Count = n(), .groups = "drop") %>%
+        mutate(SampleID = sample_name)
+      mech_list_raw[[length(mech_list_raw) + 1]] <- mech_raw
+
+      # RPKG
+      mech_rpkg <- dt %>%
+        filter(!is.na(resistance_mechanism) & resistance_mechanism != "") %>%
+        group_by(resistance_mechanism) %>%
+        summarise(Count = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+        mutate(SampleID = sample_name)
+      mech_list_rpkg[[length(mech_list_rpkg) + 1]] <- mech_rpkg
+    }
+  }
+
+  # Helper to pivot with aggregation
+  build_mat <- function(list_data, val_col) {
+    if (length(list_data) == 0) {
+      return(NULL)
+    }
+    # Aggregate duplicate (SampleID, Class) pairs before pivoting
+    # This necessary because multiple files (e.g. MAG bins) can map to the same SampleID
+    bind_rows(list_data) %>%
+      dplyr::rename(Feature = 1) %>%
+      group_by(SampleID, Feature) %>%
+      summarise(Count = sum(Count, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Feature, values_from = Count, values_fill = 0) %>%
+      column_to_rownames("SampleID")
+  }
+
+  list(
+    class_raw = build_mat(class_list_raw),
+    class_rpkg = build_mat(class_list_rpkg),
+    mech_raw = build_mat(mech_list_raw),
+    mech_rpkg = build_mat(mech_list_rpkg)
+  )
+}
+```
+
+## 1.2 Load Contigs ARGs
+
+```{r load_contigs}
+contigs_data <- read_arg_domain(
+  file.path(DATA_DIR, "01_contigs/ARG"),
+  "\\.mapping_annotated\\.tsv$",
+  function(x) gsub("\\.mapping_annotated\\.tsv$", "", x),
+  ge_df
+)
+
+# Raw for ALDEx2
+arg_class_contigs_raw <- contigs_data$class_raw
+arg_mech_contigs_raw <- contigs_data$mech_raw
+
+# RPKG for Load/Alpha/Beta
+arg_class_contigs <- contigs_data$class_rpkg
+arg_mech_contigs <- contigs_data$mech_rpkg
+
+# Align with metadata (Using RPKG as primary for downstream)
+if (!is.null(arg_class_contigs)) {
+  common <- intersect(rownames(arg_class_contigs), rownames(metadata))
+  arg_class_contigs <- arg_class_contigs[common, , drop = FALSE]
+  arg_class_contigs_raw <- arg_class_contigs_raw[common, , drop = FALSE]
+
+  if (!is.null(arg_mech_contigs)) {
+    arg_mech_contigs <- arg_mech_contigs[common, , drop = FALSE]
+    arg_mech_contigs_raw <- arg_mech_contigs_raw[common, , drop = FALSE]
+  }
+  cat("Contigs - Samples:", nrow(arg_class_contigs), "Classes:", ncol(arg_class_contigs), "\n")
+}
+```
+
+## 1.3 Load MAGs ARGs
+
+```{r load_mags}
+mags_data <- read_arg_domain(
+  file.path(DATA_DIR, "02_MAGs/ARG"),
+  "\\.mapping_annotated\\.tsv$",
+  function(x) gsub("_magscot_.*$", "", x),
+  ge_df
+)
+
+arg_class_mags_raw <- mags_data$class_raw
+arg_mech_mags_raw <- mags_data$mech_raw
+
+arg_class_mags <- mags_data$class_rpkg
+arg_mech_mags <- mags_data$mech_rpkg
+
+if (!is.null(arg_class_mags)) {
+  common <- intersect(rownames(arg_class_mags), rownames(metadata))
+  arg_class_mags <- arg_class_mags[common, , drop = FALSE]
+  arg_class_mags_raw <- arg_class_mags_raw[common, , drop = FALSE]
+
+  if (!is.null(arg_mech_mags)) {
+    arg_mech_mags <- arg_mech_mags[common, , drop = FALSE]
+    arg_mech_mags_raw <- arg_mech_mags_raw[common, , drop = FALSE]
+  }
+  cat("MAGs - Samples:", nrow(arg_class_mags), "Classes:", ncol(arg_class_mags), "\n")
+}
+```
+
+## 1.4 Load Plasmids ARGs
+
+```{r load_plasmids}
+plasmids_data <- read_arg_domain(
+  file.path(DATA_DIR, "03_Plasmids/ARG"),
+  "\\.mapping_annotated\\.tsv$",
+  function(x) gsub("_combined_plasmids.*$", "", x),
+  ge_df
+)
+
+arg_class_plasmids_raw <- plasmids_data$class_raw
+arg_mech_plasmids_raw <- plasmids_data$mech_raw
+
+arg_class_plasmids <- plasmids_data$class_rpkg
+arg_mech_plasmids <- plasmids_data$mech_rpkg
+
+if (!is.null(arg_class_plasmids)) {
+  common <- intersect(rownames(arg_class_plasmids), rownames(metadata))
+  arg_class_plasmids <- arg_class_plasmids[common, , drop = FALSE]
+  arg_class_plasmids_raw <- arg_class_plasmids_raw[common, , drop = FALSE]
+
+  if (!is.null(arg_mech_plasmids)) {
+    arg_mech_plasmids <- arg_mech_plasmids[common, , drop = FALSE]
+    arg_mech_plasmids_raw <- arg_mech_plasmids_raw[common, , drop = FALSE]
+  }
+  cat("Plasmids - Samples:", nrow(arg_class_plasmids), "Classes:", ncol(arg_class_plasmids), "\n")
+}
+```
+
+## 1.5 Load Viruses ARGs
+
+```{r load_viruses}
+viruses_data <- read_arg_domain(
+  file.path(DATA_DIR, "04_Viruses/ARG"),
+  "\\.mapping_annotated\\.tsv$",
+  function(x) gsub("_combined_hq.*$", "", x),
+  ge_df
+)
+
+arg_class_viruses_raw <- viruses_data$class_raw
+arg_mech_viruses_raw <- viruses_data$mech_raw
+
+arg_class_viruses <- viruses_data$class_rpkg
+arg_mech_viruses <- viruses_data$mech_rpkg
+
+if (!is.null(arg_class_viruses)) {
+  common <- intersect(rownames(arg_class_viruses), rownames(metadata))
+  arg_class_viruses <- arg_class_viruses[common, , drop = FALSE]
+  arg_class_viruses_raw <- arg_class_viruses_raw[common, , drop = FALSE]
+
+  if (!is.null(arg_mech_viruses)) {
+    arg_mech_viruses <- arg_mech_viruses[common, , drop = FALSE]
+    arg_mech_viruses_raw <- arg_mech_viruses_raw[common, , drop = FALSE]
+  }
+  cat("Viruses - Samples:", nrow(arg_class_viruses), "Classes:", ncol(arg_class_viruses), "\n")
+}
+```
+
+---
+---
+
+# Phase 2: ARG Load Comparison
+
+```{r arg_load}
+# Combine ARG loads from all domains
+load_df <- data.frame()
+
+add_load <- function(df, mat, domain) {
+  if (!is.null(mat) && nrow(mat) > 0) {
+    rbind(df, data.frame(
+      SampleID = rownames(mat),
+      Domain = domain,
+      ARG_Load = rowSums(mat)
+    ))
+  } else {
+    df
+  }
+}
+
+load_df <- add_load(load_df, arg_class_contigs, "Contigs")
+load_df <- add_load(load_df, arg_class_mags, "MAGs")
+load_df <- add_load(load_df, arg_class_plasmids, "Plasmids")
+load_df <- add_load(load_df, arg_class_viruses, "Viruses")
+
+load_df <- load_df %>%
+  left_join(metadata, by = "SampleID") %>%
+  mutate(Category = ifelse(Domain %in% c("Contigs", "MAGs"), "Chromosomal", "Mobile"))
+```
+
+## 2.1 Chromosomal ARG Load (Contigs + MAGs)
+
+```{r load_chromosomal}
+chromo <- load_df %>% filter(Category == "Chromosomal")
+
+if (nrow(chromo) > 0) {
+  p <- ggplot(chromo, aes(x = Domain, y = ARG_Load, fill = Group4)) +
+    geom_boxplot(position = position_dodge(0.8)) +
+    geom_jitter(aes(color = Group4), position = position_jitterdodge(0.2), alpha = 0.6, size = 2) +
+    scale_fill_manual(values = group4_colors) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(title = "ARG Load: Chromosomal (Contigs + MAGs)", x = "", y = "ARG Load (RPKG)")
+
+  print(p)
+  ggsave(file.path(OUT_DIR, "arg_load_chromosomal.pdf"), p, width = 6, height = 5)
+}
+```
+
+## 2.2 Mobile ARG Load (Plasmids + Viruses)
+
+```{r load_mobile}
+mobile <- load_df %>% filter(Category == "Mobile")
+
+if (nrow(mobile) > 0) {
+  p <- ggplot(mobile, aes(x = Domain, y = ARG_Load, fill = Group4)) +
+    geom_boxplot(position = position_dodge(0.8)) +
+    geom_jitter(aes(color = Group4), position = position_jitterdodge(0.2), alpha = 0.6, size = 2) +
+    scale_fill_manual(values = group4_colors) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(title = "ARG Load: Mobile (Plasmids + Viruses)", x = "", y = "ARG Load (RPKG)")
+
+  print(p)
+  ggsave(file.path(OUT_DIR, "arg_load_mobile.pdf"), p, width = 6, height = 5)
+}
+```
+
+## 2.3 Load Summary Table
+
+```{r load_summary}
+load_summary <- load_df %>%
+  group_by(Domain, Group4) %>%
+  summarise(
+    Mean = mean(ARG_Load, na.rm = TRUE),
+    SD = sd(ARG_Load, na.rm = TRUE),
+    Median = median(ARG_Load, na.rm = TRUE),
+    .groups = "drop"
+  )
+knitr::kable(load_summary, digits = 3, caption = "ARG Load Summary (Mean RPKG)")
+```
+
+## 2.4 Stacked ARG Load Barplot
+
+```{r load_stacked_bar}
+# Calculate mean ARG Load per Group and Domain
+load_stacked <- load_df %>%
+  group_by(Group4, Domain) %>%
+  summarise(Mean_Load = mean(ARG_Load, na.rm = TRUE), .groups = "drop")
+
+# Define Domain Order for plotting
+load_stacked$Domain <- factor(load_stacked$Domain, levels = c("Viruses", "Plasmids", "MAGs", "Contigs"))
+
+# Define colors for Domains
+domain_colors <- c(
+  "Contigs" = "#7fc97f", # Green
+  "MAGs" = "#beaed4", # Purple
+  "Plasmids" = "#fdc086", # Orange
+  "Viruses" = "#ffff99" # Yellow
+)
+
+# --- Statistical Testing on Total Load ---
+# Aggregate Total Load per Sample
+total_load_per_sample <- load_df %>%
+  group_by(SampleID, Group4) %>%
+  summarise(Total_ARG_Load = sum(ARG_Load, na.rm = TRUE), .groups = "drop")
+
+# Kruskal-Wallis Test
+kw_test <- kruskal.test(Total_ARG_Load ~ Group4, data = total_load_per_sample)
+kw_p <- kw_test$p.value
+kw_formatted <- ifelse(kw_p < 0.001, "p < 0.001", paste("p =", round(kw_p, 3)))
+
+# Pairwise Wilcoxon Test
+pairwise_res <- pairwise.wilcox.test(total_load_per_sample$Total_ARG_Load, total_load_per_sample$Group4, p.adjust.method = "fdr")
+
+cat("\n=== Total ARG Load Stats ===\n")
+print(kw_test)
+print(pairwise_res)
+
+# Stacked Barplot
+p_stacked <- ggplot(load_stacked, aes(x = Group4, y = Mean_Load, fill = Domain)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = domain_colors) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Mean ARG Load Composition by Group",
+    subtitle = paste("Total Load Comparison (Kruskal-Wallis):", kw_formatted),
+    x = "Group",
+    y = "Mean ARG Load (RPKG)",
+    fill = "Genomic Source"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+print(p_stacked)
+ggsave(file.path(OUT_DIR, "arg_load_stacked_bar.pdf"), p_stacked, width = 6, height = 5)
+```
+
+## 2.5 Chromosomal ARG Comparison (Contigs vs MAGs)
+
+```{r chromosomal_comparison}
+# --- 1. Stacked Barplot (Contigs + MAGs) ---
+chromo_stacked <- load_stacked %>%
+  filter(Domain %in% c("Contigs", "MAGs"))
+
+p_chromo_stacked <- ggplot(chromo_stacked, aes(x = Group4, y = Mean_Load, fill = Domain)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = domain_colors[c("Contigs", "MAGs")]) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Chromosomal ARG Load Composition",
+    x = "Group",
+    y = "Mean ARG Load (RPKG)",
+    fill = "Genomic Source"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_chromo_stacked)
+ggsave(file.path(OUT_DIR, "arg_load_stacked_chromosomal.pdf"), p_chromo_stacked, width = 6, height = 5)
+
+# --- 2. Correlation Analysis (Contigs vs MAGs) ---
+# Reshape to wide format
+chromo_corr_df <- load_df %>%
+  filter(Domain %in% c("Contigs", "MAGs")) %>%
+  dplyr::select(SampleID, Group4, Domain, ARG_Load) %>%
+  pivot_wider(names_from = Domain, values_from = ARG_Load, values_fill = 0)
+
+# Calculate Correlation
+if (nrow(chromo_corr_df) > 3) {
+  cor_res <- cor.test(chromo_corr_df$Contigs, chromo_corr_df$MAGs, method = "spearman")
+
+  cor_text <- paste0(
+    "Spearman R = ", round(cor_res$estimate, 3),
+    "\np-value = ", format.pval(cor_res$p.value, digits = 3)
+  )
+
+  p_corr <- ggplot(chromo_corr_df, aes(x = Contigs, y = MAGs)) +
+    geom_point(aes(color = Group4), size = 3, alpha = 0.8) +
+    geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "Correlation: Contig vs MAG ARG Load",
+      subtitle = cor_text,
+      x = "Contig ARG Load (RPKG)",
+      y = "MAG ARG Load (RPKG)"
+    )
+
+  print(p_corr)
+  ggsave(file.path(OUT_DIR, "arg_correlation_contigs_mags.pdf"), p_corr, width = 6, height = 5)
+
+  cat("\n=== Contig-MAG Correlation ===\n")
+  print(cor_res)
+} else {
+  cat("Insufficient data for correlation analysis.\n")
+}
+```
+
+---
+---
+
+## 2.6 RPKG Bar Plot by Domain
+
+This plot shows the mean ARG Load (RPKG) for each genomic domain (Contigs, MAGs, Plasmids, Viruses) with error bars representing standard error.
+
+```{r rpkg_domain_barplot, fig.width=10, fig.height=6}
+# Calculate summary statistics per Domain and Group
+rpkg_summary <- load_df %>%
+  group_by(Domain, Group4) %>%
+  summarise(
+    Mean = mean(ARG_Load, na.rm = TRUE),
+    SE = sd(ARG_Load, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Define Domain Order (Chromosomal first, then Mobile)
+rpkg_summary$Domain <- factor(rpkg_summary$Domain, levels = c("Contigs", "MAGs", "Plasmids", "Viruses"))
+
+# Define colors for Domains
+domain_fill_colors <- c(
+  "Contigs" = "#7fc97f", # Green
+  "MAGs" = "#beaed4", # Purple
+  "Plasmids" = "#fdc086", # Orange
+  "Viruses" = "#ffff99" # Yellow
+)
+
+# Grouped Bar Plot with Error Bars
+p_rpkg_domain <- ggplot(rpkg_summary, aes(x = Group4, y = Mean, fill = Domain)) +
+  geom_col(position = position_dodge(0.8), width = 0.7, color = "black", linewidth = 0.2) +
+  geom_errorbar(
+    aes(ymin = Mean - SE, ymax = Mean + SE),
+    position = position_dodge(0.8),
+    width = 0.2,
+    linewidth = 0.5
+  ) +
+  scale_fill_manual(values = domain_fill_colors, name = "Genomic Source") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "ARG Load by Genomic Domain and Management Group",
+    subtitle = "Mean ± Standard Error",
+    x = "Management Group",
+    y = "Mean ARG Load (RPKG)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+print(p_rpkg_domain)
+ggsave(file.path(OUT_DIR, "arg_load_rpkg_by_domain.pdf"), p_rpkg_domain, width = 10, height = 6)
+
+# Faceted version: One panel per Domain
+p_rpkg_facet <- ggplot(load_df, aes(x = Group4, y = ARG_Load, fill = Group4)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.size = 0.8) +
+  geom_jitter(aes(color = Group4), position = position_jitterdodge(0.2), alpha = 0.6, size = 1.5) +
+  facet_wrap(~Domain, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = group4_colors) +
+  scale_color_manual(values = group4_colors) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "ARG Load Distribution by Genomic Domain",
+    x = "Management Group",
+    y = "ARG Load (RPKG)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+print(p_rpkg_facet)
+ggsave(file.path(OUT_DIR, "arg_load_rpkg_by_domain_faceted.pdf"), p_rpkg_facet, width = 12, height = 5)
+```
+
+---
+---
+
+# Phase 3: Alpha Diversity (Hill Numbers - Raw Counts)
+
+## 3.1 ARG Class Alpha Diversity by Domain
+
+```{r alpha_class}
+# Compute Hill numbers for each domain
+hill_all <- data.frame()
+
+hill_add <- function(df, mat, domain) {
+  if (!is.null(mat) && nrow(mat) > 0) {
+    h <- calc_hill(mat)
+    if (!is.null(h)) {
+      h$Domain <- domain
+      return(bind_rows(df, h))
+    }
+  }
+  df
+}
+
+hill_all <- hill_add(hill_all, arg_class_contigs, "Contigs")
+hill_all <- hill_add(hill_all, arg_class_mags, "MAGs")
+hill_all <- hill_add(hill_all, arg_class_plasmids, "Plasmids")
+hill_all <- hill_add(hill_all, arg_class_viruses, "Viruses")
+
+if (nrow(hill_all) > 0) {
+  hill_all <- left_join(hill_all, metadata, by = "SampleID")
+
+  hill_long <- hill_all %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value")
+
+  p <- ggplot(hill_long, aes(x = Domain, y = Value, fill = Group4)) +
+    geom_boxplot(position = position_dodge(0.8)) +
+    facet_wrap(~q, scales = "free_y") +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(title = "ARG Class Alpha Diversity by Domain", y = "Hill Number", x = "")
+
+  print(p)
+  ggsave(file.path(OUT_DIR, "arg_alpha_class_by_domain.pdf"), p, width = 10, height = 5)
+
+  # Grid layout: rows = Hill metric (q0, q1, q2), columns = Domain
+  hill_long$q <- factor(hill_long$q,
+    levels = c("q0", "q1", "q2"),
+    labels = c("q0 (Richness)", "q1 (Shannon)", "q2 (Simpson)")
+  )
+  hill_long$Domain <- factor(hill_long$Domain, levels = c("Contigs", "MAGs", "Plasmids", "Viruses"))
+
+  p_grid <- ggplot(hill_long, aes(x = Group4, y = Value, fill = Group4)) +
+    geom_boxplot() +
+    geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+    facet_grid(q ~ Domain, scales = "free_y") +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      strip.text = element_text(size = 9),
+      legend.position = "none"
+    ) +
+    labs(title = "ARG Class Alpha Diversity Grid", y = "Hill Number", x = "")
+
+  print(p_grid)
+  ggsave(file.path(OUT_DIR, "arg_alpha_class_grid.pdf"), p_grid, width = 12, height = 8)
+}
+```
+
+## 3.2 ARG Mechanism Alpha Diversity by Domain
+
+```{r alpha_mechanism}
+mech_hill <- data.frame()
+
+mech_hill <- hill_add(mech_hill, arg_mech_contigs, "Contigs")
+mech_hill <- hill_add(mech_hill, arg_mech_mags, "MAGs")
+mech_hill <- hill_add(mech_hill, arg_mech_plasmids, "Plasmids")
+mech_hill <- hill_add(mech_hill, arg_mech_viruses, "Viruses")
+
+if (nrow(mech_hill) > 0) {
+  mech_hill <- left_join(mech_hill, metadata, by = "SampleID")
+
+  mech_long <- mech_hill %>%
+    pivot_longer(cols = c(q0, q1, q2), names_to = "q", values_to = "Value")
+
+  p <- ggplot(mech_long, aes(x = Domain, y = Value, fill = Group4)) +
+    geom_boxplot(position = position_dodge(0.8)) +
+    facet_wrap(~q, scales = "free_y") +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(title = "ARG Mechanism Alpha Diversity by Domain", y = "Hill Number", x = "")
+
+  print(p)
+  ggsave(file.path(OUT_DIR, "arg_alpha_mechanism_by_domain.pdf"), p, width = 10, height = 5)
+
+  # Grid layout: rows = Hill metric (q0, q1, q2), columns = Domain
+  mech_long$q <- factor(mech_long$q,
+    levels = c("q0", "q1", "q2"),
+    labels = c("q0 (Richness)", "q1 (Shannon)", "q2 (Simpson)")
+  )
+  mech_long$Domain <- factor(mech_long$Domain, levels = c("Contigs", "MAGs", "Plasmids", "Viruses"))
+
+  p_grid <- ggplot(mech_long, aes(x = Group4, y = Value, fill = Group4)) +
+    geom_boxplot() +
+    geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+    facet_grid(q ~ Domain, scales = "free_y") +
+    scale_fill_manual(values = group4_colors) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      strip.text = element_text(size = 9),
+      legend.position = "none"
+    ) +
+    labs(title = "ARG Mechanism Alpha Diversity Grid", y = "Hill Number", x = "")
+
+  print(p_grid)
+  ggsave(file.path(OUT_DIR, "arg_alpha_mechanism_grid.pdf"), p_grid, width = 12, height = 8)
+}
+```
+
+---
+---
+
+# Phase 4: Beta Diversity (CLR → Aitchison → PCA + PERMANOVA)
+
+```{r beta_helper}
+# PCA + Biplot function for any domain
+run_beta_analysis <- function(mat, domain, out_dir, meta, level = "Class") {
+  if (is.null(mat) || nrow(mat) < 3 || ncol(mat) < 2) {
+    message(paste(domain, level, "- insufficient data for beta diversity"))
+    return(NULL)
+  }
+
+  mat_filt <- filter_features(mat)
+  if (ncol(mat_filt) < 2) {
+    message(paste(domain, level, "- too few features after filtering"))
+    return(NULL)
+  }
+
+  # CLR with error handling
+  mat_clr <- tryCatch(calc_clr(mat_filt), error = function(e) {
+    message(paste(domain, level, "- CLR failed:", e$message))
+    NULL
+  })
+  if (is.null(mat_clr)) {
+    return(NULL)
+  }
+
+  # PCA
+  pca <- prcomp(mat_clr)
+  var_exp <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+  scores <- as.data.frame(pca$x)
+  scores$SampleID <- rownames(scores)
+  scores <- left_join(scores, meta, by = "SampleID")
+
+  # Top 5 loadings
+  loadings <- as.data.frame(pca$rotation)
+  loadings$Feature <- rownames(loadings)
+  loadings$Length <- sqrt(loadings$PC1^2 + loadings$PC2^2)
+  top5 <- loadings %>%
+    arrange(desc(Length)) %>%
+    head(5)
+
+  # Scale arrows
+  xr <- max(scores$PC1) - min(scores$PC1)
+  yr <- max(scores$PC2) - min(scores$PC2)
+  sf <- min(xr / (max(abs(top5$PC1)) * 2.5), yr / (max(abs(top5$PC2)) * 2.5)) * 0.7
+  top5$PC1_s <- top5$PC1 * sf
+  top5$PC2_s <- top5$PC2 * sf
+
+  # Biplot
+  p <- ggplot(scores, aes(x = PC1, y = PC2)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey80") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey80") +
+    geom_point(aes(color = Group4), size = 3.5, alpha = 0.85) +
+    geom_segment(
+      data = top5, aes(x = 0, y = 0, xend = PC1_s, yend = PC2_s),
+      arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+      color = "grey30", linewidth = 0.5
+    ) +
+    geom_text_repel(
+      data = top5, aes(x = PC1_s, y = PC2_s, label = Feature),
+      size = 3, fontface = "italic", max.overlaps = 20
+    ) +
+    scale_color_manual(values = group4_colors) +
+    theme_bw(base_size = 12) +
+    labs(
+      title = paste(domain, "ARG", level, "PCA Biplot"),
+      x = paste0("PC1 (", var_exp[1], "%)"),
+      y = paste0("PC2 (", var_exp[2], "%)")
+    )
+
+  print(p)
+  fname <- paste0("arg_pca_biplot_", tolower(gsub(" ", "_", domain)), "_", tolower(level), ".pdf")
+  ggsave(file.path(out_dir, fname), p, width = 7, height = 5)
+
+  # PERMANOVA
+  mat_dist <- calc_aitchison(mat_clr)
+  dist_samples <- attr(mat_dist, "Labels")
+  if (is.null(dist_samples)) dist_samples <- rownames(mat_filt)
+  meta_sub <- meta[dist_samples, , drop = FALSE]
+  perm <- tryCatch(
+    {
+      adonis2(mat_dist ~ Group4, data = meta_sub, permutations = 999)
+    },
+    error = function(e) {
+      message(paste(domain, level, "PERMANOVA failed:", e$message))
+      NULL
+    }
+  )
+  if (!is.null(perm)) {
+    cat("\n", domain, level, "PERMANOVA:\n")
+    print(perm)
+  }
+
+  return(list(pca = pca, perm = perm))
+}
+```
+
+## 4.1 Contigs Beta Diversity
+
+```{r beta_contigs}
+# Class Level
+beta_contigs <- run_beta_analysis(arg_class_contigs, "Contigs", OUT_DIR, metadata, level = "Class")
+# Mechanism Level
+if (exists("arg_mech_contigs")) {
+  beta_contigs_mech <- run_beta_analysis(arg_mech_contigs, "Contigs", OUT_DIR, metadata, level = "Mechanism")
+}
+```
+
+## 4.2 MAGs Beta Diversity
+
+```{r beta_mags}
+# Class Level
+beta_mags <- run_beta_analysis(arg_class_mags, "MAGs", OUT_DIR, metadata, level = "Class")
+# Mechanism Level
+if (exists("arg_mech_mags")) {
+  beta_mags_mech <- run_beta_analysis(arg_mech_mags, "MAGs", OUT_DIR, metadata, level = "Mechanism")
+}
+```
+
+## 4.3 Plasmids Beta Diversity
+
+```{r beta_plasmids}
+# Class Level
+beta_plasmids <- run_beta_analysis(arg_class_plasmids, "Plasmids", OUT_DIR, metadata, level = "Class")
+# Mechanism Level
+if (exists("arg_mech_plasmids")) {
+  beta_plasmids_mech <- run_beta_analysis(arg_mech_plasmids, "Plasmids", OUT_DIR, metadata, level = "Mechanism")
+}
+```
+
+## 4.4 Viruses Beta Diversity
+
+```{r beta_viruses}
+# Class Level
+beta_viruses <- run_beta_analysis(arg_class_viruses, "Viruses", OUT_DIR, metadata, level = "Class")
+# Mechanism Level
+if (exists("arg_mech_viruses")) {
+  beta_viruses_mech <- run_beta_analysis(arg_mech_viruses, "Viruses", OUT_DIR, metadata, level = "Mechanism")
+}
+```
+
+---
+---
+
+# Phase 5: Differential Abundance (ALDEx2 + ANCOM-BC2)
+
+# Using the unified suite from scripts/00_setup.R
+
+## 5.1 Contigs DA
+```{r da_contigs}
+# ARG Classes
+da_class_contigs <- run_da_suite(arg_class_contigs_raw, metadata, "Group4", OUT_DIR, "Contigs_Class")
+
+# ARG Mechanisms
+da_mech_contigs <- run_da_suite(arg_mech_contigs_raw, metadata, "Group4", OUT_DIR, "Contigs_Mechanism")
+```
+
+## 5.2 MAGs DA
+```{r da_mags}
+# ARG Classes
+da_class_mags <- run_da_suite(arg_class_mags_raw, metadata, "Group4", OUT_DIR, "MAGs_Class")
+
+# ARG Mechanisms
+da_mech_mags <- run_da_suite(arg_mech_mags_raw, metadata, "Group4", OUT_DIR, "MAGs_Mechanism")
+```
+
+## 5.3 Plasmids DA
+```{r da_plasmids}
+# ARG Classes
+da_class_plasmids <- run_da_suite(arg_class_plasmids_raw, metadata, "Group4", OUT_DIR, "Plasmids_Class")
+
+# ARG Mechanisms
+da_mech_plasmids <- run_da_suite(arg_mech_plasmids_raw, metadata, "Group4", OUT_DIR, "Plasmids_Mechanism")
+```
+
+## 5.4 Viruses DA
+```{r da_viruses}
+# ARG Classes
+da_class_viruses <- run_da_suite(arg_class_viruses_raw, metadata, "Group4", OUT_DIR, "Viruses_Class")
+
+# ARG Mechanisms
+da_mech_viruses <- run_da_suite(arg_mech_viruses_raw, metadata, "Group4", OUT_DIR, "Viruses_Mechanism")
+```
+
+---
+---
+
+# Phase 6: Integration & Visualization
+
+## 6.1 UpSet Plot: ARG Classes by Domain
+
+```{r upset, fig.width=10, fig.height=8}
+if (requireNamespace("UpSetR", quietly = TRUE)) {
+  library(UpSetR)
+
+  # Helper to get present features for a matrix
+  get_features <- function(mat) {
+    if (is.null(mat) || nrow(mat) == 0 || ncol(mat) == 0) {
+      return(character(0))
+    }
+    colnames(mat)[colSums(mat) > 0]
+  }
+
+  # === ARG Class UpSet ===
+  contigs_classes <- get_features(arg_class_contigs)
+  mags_classes <- get_features(arg_class_mags)
+  plasmids_classes <- get_features(arg_class_plasmids)
+  viruses_classes <- get_features(arg_class_viruses)
+
+  all_classes <- unique(c(contigs_classes, mags_classes, plasmids_classes, viruses_classes))
+
+  if (length(all_classes) > 0) {
+    upset_class_df <- data.frame(
+      Feature = all_classes,
+      Contigs = as.numeric(all_classes %in% contigs_classes),
+      MAGs = as.numeric(all_classes %in% mags_classes),
+      Plasmids = as.numeric(all_classes %in% plasmids_classes),
+      Viruses = as.numeric(all_classes %in% viruses_classes)
+    )
+
+    sets_use <- c("Contigs", "MAGs", "Plasmids", "Viruses")[
+      sapply(c("Contigs", "MAGs", "Plasmids", "Viruses"), function(s) sum(upset_class_df[[s]]) > 0)
+    ]
+
+    if (length(sets_use) >= 2) {
+      # Create basic UpSet
+      upset_plot <- upset(upset_class_df,
+        sets = sets_use, main.bar.color = "steelblue",
+        sets.bar.color = "darkgreen", order.by = "freq", text.scale = 1.2,
+        mainbar.y.label = "Intersection Size (ARG Classes)"
+      )
+      print(upset_plot)
+
+      pdf(file.path(OUT_DIR, "arg_class_upset_domains.pdf"), width = 10, height = 6)
+      print(upset_plot)
+      dev.off()
+
+      # Show class names per intersection
+      cat("\n=== ARG Classes per Domain ===\n")
+
+      # Generate detailed intersection table
+      intersection_table <- upset_class_df %>%
+        rowwise() %>%
+        mutate(Shared_By = paste(names(.)[2:5][c_across(2:5) == 1], collapse = " & ")) %>%
+        ungroup() %>%
+        filter(Shared_By != "") %>%
+        group_by(Shared_By) %>%
+        summarise(Count = n(), Features = paste(Feature, collapse = ", "), .groups = "drop") %>%
+        arrange(desc(Count))
+
+      print(knitr::kable(intersection_table, caption = "ARG Classes Shared by Domains"))
+      write.csv(intersection_table, file.path(OUT_DIR, "arg_class_intersections.csv"), row.names = FALSE)
+    }
+  }
+
+  # === ARG Mechanism UpSet ===
+  contigs_mechs <- get_features(arg_mech_contigs)
+  mags_mechs <- get_features(arg_mech_mags)
+  plasmids_mechs <- get_features(arg_mech_plasmids)
+  viruses_mechs <- get_features(arg_mech_viruses)
+
+  all_mechs <- unique(c(contigs_mechs, mags_mechs, plasmids_mechs, viruses_mechs))
+
+  if (length(all_mechs) > 0) {
+    upset_mech_df <- data.frame(
+      Feature = all_mechs,
+      Contigs = as.numeric(all_mechs %in% contigs_mechs),
+      MAGs = as.numeric(all_mechs %in% mags_mechs),
+      Plasmids = as.numeric(all_mechs %in% plasmids_mechs),
+      Viruses = as.numeric(all_mechs %in% viruses_mechs)
+    )
+
+    sets_use_mech <- c("Contigs", "MAGs", "Plasmids", "Viruses")[
+      sapply(c("Contigs", "MAGs", "Plasmids", "Viruses"), function(s) sum(upset_mech_df[[s]]) > 0)
+    ]
+
+    if (length(sets_use_mech) >= 2) {
+      upset_mech_plot <- upset(upset_mech_df,
+        sets = sets_use_mech, main.bar.color = "coral",
+        sets.bar.color = "darkred", order.by = "freq", text.scale = 1.2,
+        mainbar.y.label = "Intersection Size (ARG Mechanisms)"
+      )
+      print(upset_mech_plot)
+
+      pdf(file.path(OUT_DIR, "arg_mechanism_upset_domains.pdf"), width = 10, height = 6)
+      print(upset_mech_plot)
+      dev.off()
+
+      cat("\n=== ARG Mechanisms per Domain ===\n")
+
+      # Generate detailed intersection table
+      intersection_mech_table <- upset_mech_df %>%
+        rowwise() %>%
+        mutate(Shared_By = paste(names(.)[2:5][c_across(2:5) == 1], collapse = " & ")) %>%
+        ungroup() %>%
+        filter(Shared_By != "") %>%
+        group_by(Shared_By) %>%
+        summarise(Count = n(), Features = paste(Feature, collapse = ", "), .groups = "drop") %>%
+        arrange(desc(Count))
+
+      print(knitr::kable(intersection_mech_table, caption = "ARG Mechanisms Shared by Domains"))
+      write.csv(intersection_mech_table, file.path(OUT_DIR, "arg_mechanism_intersections.csv"), row.names = FALSE)
+    }
+  }
+} else {
+  message("UpSetR not installed")
+}
+```
+
+## 6.2 Sankey Diagram: Mechanism → Class
+
+```{r sankey, fig.width=12, fig.height=8}
+if (requireNamespace("ggalluvial", quietly = TRUE)) {
+  library(ggalluvial)
+
+  # Build flow from all raw ARG files across domains with sample info
+  sankey_data <- data.frame()
+
+  domains <- list(
+    list(dir = "01_contigs/ARG", name = "Contigs"),
+    list(dir = "02_MAGs/ARG", name = "MAGs"),
+    list(dir = "03_Plasmids/ARG", name = "Plasmids"),
+    list(dir = "04_Viruses/ARG", name = "Viruses")
+  )
+
+  for (d in domains) {
+    file_dir <- file.path(DATA_DIR, d$dir)
+    files <- list.files(file_dir, pattern = "\\.mapping_annotated\\.tsv$", full.names = TRUE)
+
+    for (f in files) {
+      dt <- tryCatch(read.delim(f, stringsAsFactors = FALSE), error = function(e) NULL)
+      if (is.null(dt) || nrow(dt) == 0) next
+
+      # Extract sample name
+      sample_name <- gsub("\\.mapping_annotated\\.tsv$", "", basename(f))
+      if (d$name == "MAGs") sample_name <- gsub("_magscot_.*$", "", sample_name)
+      if (d$name == "Plasmids") sample_name <- gsub("_combined_plasmids.*$", "", sample_name)
+      if (d$name == "Viruses") sample_name <- gsub("_combined_hq.*$", "", sample_name)
+
+      # Find class column
+      class_col <- intersect(colnames(dt), c("drug_class", "predicted_ARG.class", "predicted_ARG_class"))
+      if (length(class_col) == 0 || !"resistance_mechanism" %in% colnames(dt)) next
+
+      # Calculate RPKG
+      ge_info <- get_genome_equivalents(sample_name, ge_df)
+      dt$coverage <- as.numeric(str_extract(dt$read_id, "(?<=cov_)[0-9.]+"))
+
+      if (!is.null(ge_info) && !all(is.na(dt$coverage))) {
+        cov_vals <- dt$coverage
+        cov_vals[is.na(cov_vals)] <- 1
+        dt$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+      } else {
+        dt$RPKG <- 1 # Fallback
+        if (is.null(ge_info)) warning(paste("Sankey: Missing GE for", sample_name))
+      }
+
+      df_tmp <- data.frame(
+        Mechanism = dt$resistance_mechanism,
+        Class = dt[[class_col[1]]],
+        Domain = d$name,
+        SampleID = sample_name,
+        RPKG = dt$RPKG,
+        stringsAsFactors = FALSE
+      )
+      sankey_data <- rbind(sankey_data, df_tmp)
+    }
+  }
+
+  # Filter valid entries and add Group4
+  sankey_data <- sankey_data %>%
+    dplyr::filter(!is.na(Mechanism), Mechanism != "", !is.na(Class), Class != "") %>%
+    dplyr::left_join(metadata %>% dplyr::select(Group4) %>% tibble::rownames_to_column("SampleID_join"), by = c("SampleID" = "SampleID_join")) %>%
+    dplyr::filter(!is.na(Group4))
+
+  if (nrow(sankey_data) > 0) {
+    # Get top mechanisms and classes
+    top_mechs <- sankey_data %>%
+      dplyr::group_by(Mechanism) %>%
+      dplyr::summarise(n = sum(RPKG, na.rm = TRUE)) %>%
+      dplyr::arrange(desc(n)) %>%
+      dplyr::slice_head(n = 6) %>%
+      dplyr::pull(Mechanism)
+
+    top_classes <- sankey_data %>%
+      dplyr::group_by(Class) %>%
+      dplyr::summarise(n = sum(RPKG, na.rm = TRUE)) %>%
+      dplyr::arrange(desc(n)) %>%
+      dplyr::slice_head(n = 8) %>%
+      dplyr::pull(Class)
+
+    sankey_filtered <- sankey_data %>%
+      dplyr::filter(Mechanism %in% top_mechs, Class %in% top_classes)
+
+    # === Combined Sankey with Domain coloring ===
+    if (nrow(sankey_filtered) > 0) {
+      sankey_counts <- sankey_filtered %>%
+        dplyr::group_by(Mechanism, Class, Domain) %>%
+        dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+      p_domain <- ggplot(sankey_counts, aes(axis1 = Mechanism, axis2 = Class, axis3 = Domain, y = n)) +
+        geom_alluvium(aes(fill = Domain), alpha = 0.7) +
+        geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+        geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+        scale_fill_brewer(palette = "Set2") +
+        theme_minimal(base_size = 10) +
+        labs(title = "ARG Flow: Mechanism -> Class -> Domain", y = "Abundance (RPKG)") +
+        theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+      print(p_domain)
+      ggsave(file.path(OUT_DIR, "arg_sankey_flow_domain.pdf"), p_domain, width = 10, height = 7)
+
+      # === Combined Sankey with Group4 coloring ===
+      sankey_counts_group <- sankey_filtered %>%
+        dplyr::group_by(Mechanism, Class, Group4) %>%
+        dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+      p_group <- ggplot(sankey_counts_group, aes(axis1 = Mechanism, axis2 = Class, axis3 = Group4, y = n)) +
+        geom_alluvium(aes(fill = Group4), alpha = 0.7) +
+        geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+        geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+        scale_fill_manual(values = group4_colors) +
+        theme_minimal(base_size = 10) +
+        labs(title = "ARG Flow: Mechanism -> Class -> Group", y = "Abundance (RPKG)") +
+        theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+      print(p_group)
+      ggsave(file.path(OUT_DIR, "arg_sankey_flow_group.pdf"), p_group, width = 10, height = 7)
+
+      # === Per-Group4 Sankey plots ===
+      for (grp in unique(sankey_filtered$Group4)) {
+        grp_data <- sankey_filtered %>%
+          dplyr::filter(Group4 == grp) %>%
+          dplyr::group_by(Mechanism, Class, Domain) %>%
+          dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+        if (nrow(grp_data) > 5) {
+          p_grp <- ggplot(grp_data, aes(axis1 = Mechanism, axis2 = Class, axis3 = Domain, y = n)) +
+            geom_alluvium(aes(fill = Domain), alpha = 0.7) +
+            geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+            geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+            scale_fill_brewer(palette = "Set2") +
+            theme_minimal(base_size = 10) +
+            labs(title = paste("ARG Flow:", grp), y = "Abundance (RPKG)") +
+            theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+          print(p_grp)
+          fname <- paste0("arg_sankey_", gsub(" ", "_", grp), ".pdf")
+          ggsave(file.path(OUT_DIR, fname), p_grp, width = 10, height = 7)
+        }
+      }
+
+
+      # === Global Simple Sankey (Mech -> Class, Aggregated) ===
+      sankey_simple <- sankey_filtered %>%
+        dplyr::group_by(Mechanism, Class) %>%
+        dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+      p_simple <- ggplot(sankey_simple, aes(axis1 = Mechanism, axis2 = Class, y = n)) +
+        geom_alluvium(fill = "steelblue", alpha = 0.7) +
+        geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+        geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+        theme_minimal(base_size = 10) +
+        labs(title = "ARG Flow: Mechanism -> Class (Aggregated)", y = "Abundance (RPKG)") +
+        theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+      print(p_simple)
+      ggsave(file.path(OUT_DIR, "arg_sankey_flow_simple_aggregated.pdf"), p_simple, width = 8, height = 7)
+
+      # === Per-Domain Sankey plots ===
+      # 1. Mechanism -> Class -> Group (Detailed)
+      for (dom in unique(sankey_filtered$Domain)) {
+        dom_data <- sankey_filtered %>%
+          dplyr::filter(Domain == dom) %>%
+          dplyr::group_by(Mechanism, Class, Group4) %>%
+          dplyr::summarise(n = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+        if (nrow(dom_data) > 5) {
+          p_dom <- ggplot(dom_data, aes(axis1 = Mechanism, axis2 = Class, axis3 = Group4, y = n)) +
+            geom_alluvium(aes(fill = Group4), alpha = 0.7) +
+            geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+            geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+            scale_fill_manual(values = group4_colors) +
+            theme_minimal(base_size = 10) +
+            labs(title = paste("ARG Flow (", dom, "): Mechanism -> Class -> Group"), y = "Abundance (RPKG)") +
+            theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+          print(p_dom)
+          fname <- paste0("arg_sankey_domain_", gsub(" ", "_", dom), "_detailed.pdf")
+          ggsave(file.path(OUT_DIR, fname), p_dom, width = 10, height = 7)
+
+          # 2. Mechanism -> Class (Aggregated, No Group Split)
+          dom_simple <- dom_data %>%
+            dplyr::group_by(Mechanism, Class) %>%
+            dplyr::summarise(n = sum(n), .groups = "drop")
+
+          p_dom_simple <- ggplot(dom_simple, aes(axis1 = Mechanism, axis2 = Class, y = n)) +
+            geom_alluvium(fill = "steelblue", alpha = 0.7) +
+            geom_stratum(width = 1 / 3, fill = "grey90", color = "grey50") +
+            geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+            theme_minimal(base_size = 10) +
+            labs(title = paste("ARG Flow (", dom, "): Mechanism -> Class (Aggregated)"), y = "Abundance (RPKG)") +
+            theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+          print(p_dom_simple)
+          fname_simple <- paste0("arg_sankey_domain_", gsub(" ", "_", dom), "_aggregated.pdf")
+          ggsave(file.path(OUT_DIR, fname_simple), p_dom_simple, width = 8, height = 7)
+        }
+      }
+    } else {
+      message("No data for Sankey diagram after filtering")
+    }
+  } else {
+    message("No Sankey data available")
+  }
+} else {
+  message("ggalluvial not installed")
+}
+```
+
+## 6.3 Mobile Resistome Analysis (Plasmids + Viruses)
+
+This section identifies "Mobile ARGs" as those detected in Plasmid or Viral fractions.
+Quantification is based on **RPKG (Reads Per Kilobase per Genome equivalent)**, representing normalized abundance.
+
+```{r mobile_resistome}
+# Define mobile sources using RPKG data
+mobile_list <- list()
+if (exists("arg_class_plasmids") && !is.null(arg_class_plasmids)) mobile_list$Plasmids <- arg_class_plasmids
+if (exists("arg_class_viruses") && !is.null(arg_class_viruses)) mobile_list$Viruses <- arg_class_viruses
+
+if (length(mobile_list) > 0) {
+  # 1. Aggregate Counts
+  # Get all unique features across mobile domains
+  all_feats <- unique(unlist(lapply(mobile_list, rownames)))
+  all_samps <- unique(unlist(lapply(mobile_list, colnames)))
+
+  mobile_mat <- matrix(0,
+    nrow = length(all_feats), ncol = length(all_samps),
+    dimnames = list(all_feats, all_samps)
+  )
+
+  for (d in names(mobile_list)) {
+    mat <- as.matrix(mobile_list[[d]])
+    # Match samples and features
+    common_f <- intersect(rownames(mat), all_feats)
+    common_s <- intersect(colnames(mat), all_samps)
+    mobile_mat[common_f, common_s] <- mobile_mat[common_f, common_s] + mat[common_f, common_s]
+  }
+
+  # Filter for non-zero mobile ARGs
+  valid_mobile <- rowSums(mobile_mat) > 0
+  mobile_mat_filt <- mobile_mat[valid_mobile, , drop = FALSE]
+
+  cat("Total Mobile ARGs detected:", nrow(mobile_mat_filt), "\n")
+
+  # 2. Top Mobile ARG per Sample
+  # 2. Top Mobile ARG per Sample
+  # Robust construction to avoid dimension errors
+  top_mobile_list <- lapply(colnames(mobile_mat_filt), function(s) {
+    vals <- mobile_mat_filt[, s]
+    if (sum(vals) == 0) {
+      data.frame(SampleID = s, ARG = "None", Abundance_RPKG = 0, stringsAsFactors = FALSE)
+    } else {
+      idx <- which.max(vals)
+      data.frame(SampleID = s, ARG = names(vals)[idx], Abundance_RPKG = vals[idx], stringsAsFactors = FALSE)
+    }
+  })
+
+  top_mobile_per_sample <- do.call(rbind, top_mobile_list)
+
+  top_mobile_per_sample$Abundance_RPKG <- as.numeric(top_mobile_per_sample$Abundance_RPKG)
+  top_mobile_per_sample <- top_mobile_per_sample %>%
+    left_join(metadata, by = "SampleID") %>%
+    arrange(Group4, desc(Abundance_RPKG))
+
+  write.csv(top_mobile_per_sample, file.path(OUT_DIR, "top_mobile_arg_per_sample_rpkg.csv"), row.names = FALSE)
+
+  knitr::kable(head(top_mobile_per_sample, 20), caption = "Top Mobile ARG per Sample (RPKG)")
+
+  # 3. Aggregated Heatmap of Top Mobile ARGs
+  top_30_mobile <- names(sort(rowSums(mobile_mat_filt), decreasing = TRUE))[1:min(30, nrow(mobile_mat_filt))]
+
+  if (length(top_30_mobile) > 1) {
+    pheatmap::pheatmap(log1p(mobile_mat_filt[top_30_mobile, ]),
+      scale = "none",
+      cluster_rows = TRUE,
+      cluster_cols = TRUE,
+      show_colnames = FALSE,
+      annotation_col = metadata %>% dplyr::select(Group4),
+      annotation_colors = list(Group4 = group4_colors),
+      main = "Top 30 Mobile ARGs (Log1p RPKG)",
+      filename = file.path(OUT_DIR, "mobile_resistome_heatmap_rpkg.pdf"),
+      width = 10, height = 8
+    )
+  }
+
+  # 4. List of Mobile ARGs
+  write.table(rownames(mobile_mat_filt), file.path(OUT_DIR, "list_of_mobile_args.txt"),
+    row.names = FALSE, col.names = FALSE, quote = FALSE
+  )
+} else {
+  message("No Plasmid or Virus RPKG data available")
+}
+```
+
+---
+---
+
+# Phase 7: Heatmaps
+
+## 7.1 ARG Class Heatmaps per Domain
+
+```{r heatmaps_class}
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  library(pheatmap)
+
+  # Helper function for domain heatmaps
+  make_heatmap <- function(mat, domain, type, out_dir, meta) {
+    if (is.null(mat) || nrow(mat) < 3 || ncol(mat) < 2) {
+      message(paste(domain, "-", type, "insufficient data for heatmap"))
+      return(NULL)
+    }
+
+    # Get top 15 features by mean abundance
+    top_features <- names(sort(colMeans(mat), decreasing = TRUE)[1:min(15, ncol(mat))])
+    mat_top <- mat[, top_features, drop = FALSE]
+
+    # Z-score scale
+    mat_scaled <- scale(mat_top)
+
+    # Annotation
+    annot <- data.frame(Group4 = meta[rownames(mat_scaled), "Group4"])
+    rownames(annot) <- rownames(mat_scaled)
+
+    # Colors
+    annot_colors <- list(Group4 = group4_colors)
+
+    # Plot - use silent=FALSE for display, then save separately
+    p <- pheatmap(t(mat_scaled),
+      cluster_rows = TRUE, cluster_cols = FALSE,
+      annotation_col = annot, annotation_colors = annot_colors,
+      main = paste(domain, "-", type, "(Z-score, Top 15)"),
+      show_colnames = FALSE, fontsize = 9
+    )
+
+    # Save to PDF
+    fname <- paste0("arg_heatmap_", tolower(domain), "_", tolower(type), ".pdf")
+    pdf(file.path(out_dir, fname), width = 8, height = 6)
+    grid::grid.newpage()
+    grid::grid.draw(p$gtable)
+    dev.off()
+
+    return(p)
+  }
+
+  # Class heatmaps per domain
+  cat("\n=== Class Heatmaps ===\n")
+  if (exists("arg_class_contigs")) make_heatmap(arg_class_contigs, "Contigs", "Class", OUT_DIR, metadata)
+  if (exists("arg_class_mags")) make_heatmap(arg_class_mags, "MAGs", "Class", OUT_DIR, metadata)
+  if (exists("arg_class_plasmids")) make_heatmap(arg_class_plasmids, "Plasmids", "Class", OUT_DIR, metadata)
+  if (exists("arg_class_viruses")) make_heatmap(arg_class_viruses, "Viruses", "Class", OUT_DIR, metadata)
+}
+```
+
+## 7.2 ARG Mechanism Heatmaps per Domain
+
+```{r heatmaps_mechanism}
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  cat("\n=== Mechanism Heatmaps ===\n")
+  if (exists("arg_mech_contigs")) make_heatmap(arg_mech_contigs, "Contigs", "Mechanism", OUT_DIR, metadata)
+  if (exists("arg_mech_mags")) make_heatmap(arg_mech_mags, "MAGs", "Mechanism", OUT_DIR, metadata)
+  if (exists("arg_mech_plasmids")) make_heatmap(arg_mech_plasmids, "Plasmids", "Mechanism", OUT_DIR, metadata)
+  if (exists("arg_mech_viruses")) make_heatmap(arg_mech_viruses, "Viruses", "Mechanism", OUT_DIR, metadata)
+}
+```
+
+## 7.3 Combined Heatmap: All Domains (Class)
+
+```{r heatmap_combined_class}
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  # Helper for per-domain Z-scaling
+  scale_per_domain <- function(mat_list, domains) {
+    scaled_list <- list()
+    for (i in seq_along(mat_list)) {
+      mat <- mat_list[[i]]
+      if (!is.null(mat) && nrow(mat) > 0 && ncol(mat) > 0) {
+        # Check for zero variance to avoid NaNs
+        mat_scaled <- scale(mat)
+        mat_scaled[is.nan(mat_scaled)] <- 0 # Handle invariant columns
+        rownames(mat_scaled) <- paste0(domains[i], "_", rownames(mat))
+        scaled_list[[i]] <- data.frame(mat_scaled, Domain = domains[i], SampleID = rownames(mat_scaled), check.names = FALSE)
+      }
+    }
+    bind_rows(scaled_list)
+  }
+
+  all_class_mats <- list(arg_class_contigs, arg_class_mags, arg_class_plasmids, arg_class_viruses)
+  domains <- c("Contigs", "MAGs", "Plasmids", "Viruses")
+
+  # 1. Determine Top Classes (Global Mean)
+  combined_raw <- bind_rows(lapply(seq_along(all_class_mats), function(i) {
+    m <- all_class_mats[[i]]
+    if (!is.null(m) && nrow(m) > 0) as.data.frame(m) else NULL
+  }))
+
+  if (nrow(combined_raw) > 0) {
+    top_classes <- names(sort(colMeans(combined_raw, na.rm = TRUE), decreasing = TRUE)[1:min(20, ncol(combined_raw))])
+
+    # 2. Subset and Scale per Domain
+    class_mats_top <- lapply(all_class_mats, function(m) {
+      if (!is.null(m) && nrow(m) > 0) m[, intersect(top_classes, colnames(m)), drop = FALSE] else NULL
+    })
+
+    scaled_df <- scale_per_domain(class_mats_top, domains)
+
+    if (nrow(scaled_df) > 0) {
+      domain_info <- scaled_df %>% dplyr::select(Domain, SampleID)
+      scaled_mat <- scaled_df %>%
+        dplyr::select(-Domain, -SampleID) %>%
+        as.data.frame()
+      rownames(scaled_mat) <- scaled_df$SampleID
+      scaled_mat[is.na(scaled_mat)] <- 0
+
+      # Ensure all top classes are columns (fill missing with 0)
+      missing_cols <- setdiff(top_classes, colnames(scaled_mat))
+      if (length(missing_cols) > 0) scaled_mat[missing_cols] <- 0
+      scaled_mat <- scaled_mat[, top_classes, drop = FALSE]
+
+      # Annotation
+      annot <- data.frame(Domain = domain_info$Domain, row.names = domain_info$SampleID)
+      annot$Group4 <- sapply(rownames(annot), function(x) {
+        orig_sample <- gsub("^[A-Za-z]+_", "", x)
+        if (orig_sample %in% rownames(metadata)) metadata[orig_sample, "Group4"] else NA
+      })
+
+      domain_colors <- c("Contigs" = "#E41A1C", "MAGs" = "#377EB8", "Plasmids" = "#4DAF4A", "Viruses" = "#984EA3")
+
+      p_comb <- pheatmap(t(as.matrix(scaled_mat)),
+        cluster_rows = TRUE, cluster_cols = FALSE,
+        annotation_col = annot,
+        annotation_colors = list(Group4 = group4_colors, Domain = domain_colors),
+        main = "Combined ARG Class Heatmap (Per-Domain Z-Scaled, Top 20)",
+        show_colnames = FALSE, fontsize = 9,
+        # Calculate gaps based on actual data presence
+        gaps_col = cumsum(table(factor(annot$Domain, levels = domains)))
+      )
+
+      # Save to PDF
+      pdf(file.path(OUT_DIR, "arg_heatmap_combined_class.pdf"), width = 14, height = 8)
+      grid::grid.newpage()
+      grid::grid.draw(p_comb$gtable)
+      dev.off()
+    }
+  }
+}
+```
+
+## 7.4 Combined Heatmap: All Domains (Mechanism)
+
+```{r heatmap_combined_mechanism}
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  # Per-Domain Scaling Logic for Mechanism
+
+  # Helper for per-domain Z-scaling (Redefined for robustness)
+  scale_per_domain <- function(mat_list, domains) {
+    scaled_list <- list()
+    for (i in seq_along(mat_list)) {
+      mat <- mat_list[[i]]
+      if (!is.null(mat) && nrow(mat) > 0 && ncol(mat) > 0) {
+        mat_scaled <- scale(mat)
+        mat_scaled[is.nan(mat_scaled)] <- 0
+        rownames(mat_scaled) <- paste0(domains[i], "_", rownames(mat))
+        scaled_list[[i]] <- data.frame(mat_scaled, Domain = domains[i], SampleID = rownames(mat_scaled), check.names = FALSE)
+      }
+    }
+    bind_rows(scaled_list)
+  }
+
+  all_mech_mats <- list(arg_mech_contigs, arg_mech_mags, arg_mech_plasmids, arg_mech_viruses)
+  domains <- c("Contigs", "MAGs", "Plasmids", "Viruses")
+
+  combined_raw_mech <- bind_rows(lapply(seq_along(all_mech_mats), function(i) {
+    m <- all_mech_mats[[i]]
+    if (!is.null(m) && nrow(m) > 0) as.data.frame(m) else NULL
+  }))
+
+  if (nrow(combined_raw_mech) > 0) {
+    top_mechs <- names(sort(colMeans(combined_raw_mech, na.rm = TRUE), decreasing = TRUE)[1:min(20, ncol(combined_raw_mech))])
+
+    mech_mats_top <- lapply(all_mech_mats, function(m) {
+      if (!is.null(m) && nrow(m) > 0) m[, intersect(top_mechs, colnames(m)), drop = FALSE] else NULL
+    })
+
+    # Use scale_per_domain from previous chunk
+    scaled_mech_df <- scale_per_domain(mech_mats_top, domains)
+
+    if (nrow(scaled_mech_df) > 0) {
+      domain_info_mech <- scaled_mech_df %>% dplyr::select(Domain, SampleID)
+      scaled_mech_mat <- scaled_mech_df %>%
+        dplyr::select(-Domain, -SampleID) %>%
+        as.data.frame()
+      rownames(scaled_mech_mat) <- scaled_mech_df$SampleID
+      scaled_mech_mat[is.na(scaled_mech_mat)] <- 0
+
+      missing_cols <- setdiff(top_mechs, colnames(scaled_mech_mat))
+      if (length(missing_cols) > 0) scaled_mech_mat[missing_cols] <- 0
+      scaled_mech_mat <- scaled_mech_mat[, top_mechs, drop = FALSE]
+
+      annot_mech <- data.frame(Domain = domain_info_mech$Domain, row.names = domain_info_mech$SampleID)
+      annot_mech$Group4 <- sapply(rownames(annot_mech), function(x) {
+        orig_sample <- gsub("^[A-Za-z]+_", "", x)
+        if (orig_sample %in% rownames(metadata)) metadata[orig_sample, "Group4"] else NA
+      })
+
+      domain_colors <- c("Contigs" = "#E41A1C", "MAGs" = "#377EB8", "Plasmids" = "#4DAF4A", "Viruses" = "#984EA3")
+
+      p_mech_comb <- pheatmap(t(as.matrix(scaled_mech_mat)),
+        cluster_rows = TRUE, cluster_cols = FALSE,
+        annotation_col = annot_mech,
+        annotation_colors = list(Group4 = group4_colors, Domain = domain_colors),
+        main = "Combined ARG Mechanism Heatmap (Per-Domain Z-Scaled, Top 20)",
+        show_colnames = FALSE, fontsize = 9,
+        gaps_col = cumsum(table(factor(annot_mech$Domain, levels = domains)))
+      )
+
+      # Save to PDF
+      pdf(file.path(OUT_DIR, "arg_heatmap_combined_mechanism.pdf"), width = 14, height = 8)
+      grid::grid.newpage()
+      grid::grid.draw(p_mech_comb$gtable)
+      dev.off()
+    }
+  }
+}
+```
+
+
+
+---
+---
+
+## 7.5 Plasmid Mobility & Resistome Heatmap (ARG x Mobility)
+
+```{r heatmap_mobility_arg}
+# Load MOB-typer & Plasmid ARG Data (if not strictly loaded in Phase 3 of this notebook)
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  cat("\n=== Loading Mobility Data for Heatmap ===\n")
+
+  # 1. Load MOB-typer
+  mobtyper_dir <- file.path(DATA_DIR, "03_Plasmids/Host_range_mobility/mobtyper_results")
+  mobtyper_files <- list.files(mobtyper_dir, pattern = "_mobtyper\\.tsv$", full.names = TRUE)
+
+  mobtyper_list <- lapply(mobtyper_files, function(f) {
+    df <- tryCatch(fread(f), error = function(e) NULL)
+    if (is.null(df) || nrow(df) == 0) {
+      return(NULL)
+    }
+    df$Sample <- gsub("_mobtyper\\.tsv$", "", basename(f))
+    return(df)
+  })
+
+  if (length(mobtyper_list) > 0) {
+    mob_df <- rbindlist(mobtyper_list, fill = TRUE) %>%
+      mutate(
+        Mobility = case_when(
+          grepl("conjugative", predicted_mobility, ignore.case = TRUE) ~ "Conjugative",
+          grepl("mobilizable", predicted_mobility, ignore.case = TRUE) ~ "Mobilizable",
+          grepl("non-mobilizable", predicted_mobility, ignore.case = TRUE) ~ "Non-mobilizable",
+          TRUE ~ "Unknown"
+        ),
+        PlasmidID = stringr::str_extract(sample_id, "NODE_\\d+_length_\\d+_cov_[0-9.]+")
+      ) %>%
+      dplyr::select(Sample, PlasmidID, Mobility) %>% # Only need these for joining
+      distinct(Sample, PlasmidID, .keep_all = TRUE)
+
+    # 2. Load Plasmid ARG Data (Raw for joining)
+    plasmid_arg_dir <- file.path(DATA_DIR, "03_Plasmids/ARG")
+    p_arg_files <- list.files(plasmid_arg_dir, pattern = "_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", full.names = TRUE)
+
+    p_arg_list <- lapply(p_arg_files, function(f) {
+      sample_name <- gsub("_combined_plasmids_95-85\\.mapping_annotated\\.tsv$", "", basename(f))
+      df <- tryCatch(fread(f), error = function(e) NULL)
+      if (is.null(df) || nrow(df) == 0) {
+        return(NULL)
+      }
+
+      # Calculate RPKG
+      ge_info <- get_genome_equivalents(sample_name, ge_df)
+      df$coverage <- as.numeric(stringr::str_extract(df$read_id, "(?<=cov_)[0-9.]+"))
+
+      if (!is.null(ge_info) && !all(is.na(df$coverage))) {
+        cov_vals <- df$coverage
+        cov_vals[is.na(cov_vals)] <- 1
+        df$RPKG <- (cov_vals * 1000) / (ge_info$rl * ge_info$ge)
+      } else {
+        df$RPKG <- 1 # Fallback
+      }
+      df$Sample <- sample_name
+      return(df)
+    })
+    p_arg_df <- rbindlist(p_arg_list, fill = TRUE)
+
+    # 3. Join and Aggregate
+    # Join Plasmid ARGs with Mobility
+    # Ensure columns match: read_id in ARGs matches PlasmidID in MOB-typer
+    combined_mob_arg <- p_arg_df %>%
+      left_join(mob_df, by = c("Sample", "read_id" = "PlasmidID")) %>%
+      mutate(Mobility = ifelse(is.na(Mobility), "Unknown", Mobility)) %>%
+      filter(Mobility %in% c("Conjugative", "Mobilizable")) # Focus on Mobile types as requested (vs Non-mobilizable)
+    # User asked: "which are on mobile plasmids and which are on conjugative"
+    # Usually "Mobile" implies Mobilizable + Conjugative. "Conjugative" is specific.
+    # Let's keep Mobilizable and Conjugative.
+
+    # Function to create heatmap for a rank
+    plot_mobility_heatmap <- function(data, rank_col, title_prefix) {
+      # Aggregate RPKG by Sample + Mobility + Rank
+      agg <- data %>%
+        group_by(Sample, Mobility, !!sym(rank_col)) %>%
+        summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+        mutate(ColID = paste0(Mobility, "_", Sample)) # Create unique column for heatmap
+
+      # Pivot to Wide
+      mat_df <- agg %>%
+        dplyr::select(ColID, !!sym(rank_col), RPKG) %>%
+        pivot_wider(names_from = ColID, values_from = RPKG, values_fill = 0) %>%
+        column_to_rownames(rank_col)
+
+      # Top 25 Features
+      if (nrow(mat_df) > 0) {
+        top_features <- names(sort(rowMeans(mat_df), decreasing = TRUE)[1:min(25, nrow(mat_df))])
+        mat_top <- mat_df[top_features, , drop = FALSE]
+
+        # Scale (Z-score)
+        mat_scaled <- t(scale(t(mat_top)))
+        mat_scaled[is.nan(mat_scaled)] <- 0
+
+        # Annotation
+        col_names <- colnames(mat_scaled)
+        annot <- data.frame(row.names = col_names)
+        annot$Mobility <- sapply(col_names, function(x) strsplit(x, "_")[[1]][1])
+        annot$Sample <- sapply(col_names, function(x) sub(paste0("^", strsplit(x, "_")[[1]][1], "_"), "", x))
+        # Handle metadata lookup
+        annot$Group4 <- sapply(annot$Sample, function(x) {
+          if (x %in% rownames(metadata)) metadata[x, "Group4"] else NA
+        })
+
+        # Mobility Colors
+        mob_colors <- c("Conjugative" = "#D95F02", "Mobilizable" = "#7570B3", "Unknown" = "#999999")
+
+        p <- pheatmap(mat_scaled,
+          cluster_rows = TRUE, cluster_cols = TRUE,
+          annotation_col = annot[, c("Mobility", "Group4")],
+          annotation_colors = list(Mobility = mob_colors, Group4 = group4_colors),
+          main = paste(title_prefix, "(Top 25, Z-scored RPKG)"),
+          fontsize = 9, show_colnames = FALSE
+        )
+
+        # Save
+        filename <- paste0("arg_heatmap_mobility_", tolower(rank_col), ".pdf")
+        pdf(file.path(OUT_DIR, filename), width = 14, height = 8)
+        grid::grid.newpage()
+        grid::grid.draw(p$gtable)
+        dev.off()
+        cat("Saved:", filename, "\n")
+      }
+    }
+
+    if (nrow(combined_mob_arg) > 0) {
+      plot_mobility_heatmap(combined_mob_arg, "class", "Plasmid Mobility: Class")
+      plot_mobility_heatmap(combined_mob_arg, "mechanism", "Plasmid Mobility: Mechanism")
+    } else {
+      cat("No plasmid ARG data matched with Mobility info.\n")
+    }
+  }
+}
+```
+
+---
+---
+
+# Save Data
+
+```{r save}
+saveRDS(arg_class_contigs, file.path(RESULTS_DIR, "data_objects", "arg_class_contigs.rds"))
+saveRDS(arg_mech_contigs, file.path(RESULTS_DIR, "data_objects", "arg_mech_contigs.rds"))
+saveRDS(load_df, file.path(RESULTS_DIR, "data_objects", "arg_load_all_domains.rds"))
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

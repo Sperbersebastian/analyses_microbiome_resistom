@@ -1,0 +1,188 @@
+---
+title: "00 - Global Setup"
+author: "Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Global Setup
+
+This notebook defines global variables, loads libraries, and sets up helper functions for the analysis.
+
+## Load Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(phyloseq)
+  library(vegan)
+  library(zCompositions)
+  library(ggplot2)
+})
+```
+
+## Define Paths
+
+```{r paths}
+DATA_DIR <- "/media/Box/applesurface_management/00_Data_antigravity"
+RESULTS_DIR <- file.path(DATA_DIR, "results")
+
+if (!dir.exists(RESULTS_DIR)) dir.create(RESULTS_DIR)
+if (!dir.exists(file.path(RESULTS_DIR, "data_objects"))) dir.create(file.path(RESULTS_DIR, "data_objects"))
+```
+
+## Sample Metadata
+
+12 metagenomes from fruit surfaces:
+- ISR_Org (3), ISR_Conv (3), USA_Conv1 (3), USA_Conv2 (3)
+
+```{r metadata}
+sample_names <- c(
+  "ISR_Org_1", "ISR_Org_2", "ISR_Org_3",
+  "ISR_Conv1_1", "ISR_Conv1_2", "ISR_Conv1_3",
+  "USA_Conv1_1", "USA_Conv1_2", "USA_Conv1_3",
+  "USA_Conv2_1", "USA_Conv2_2", "USA_Conv2_3"
+)
+
+metadata <- data.frame(
+  SampleID = sample_names,
+  Group4 = c(rep("ISR_Org", 3), rep("ISR_Conv", 3), rep("USA_Conv1", 3), rep("USA_Conv2", 3)),
+  Country = c(rep("ISR", 6), rep("USA", 6)),
+  Management = c(rep("Org", 3), rep("Conv", 3), rep("Conv", 6))
+)
+rownames(metadata) <- metadata$SampleID
+
+knitr::kable(metadata, caption = "Sample Metadata")
+```
+
+## Color Palette
+
+```{r colors}
+group4_colors <- c(
+  "ISR_Org" = "#1b9e77",
+  "ISR_Conv" = "#d95f02",
+  "USA_Conv1" = "#7570b3",
+  "USA_Conv2" = "#e7298a"
+)
+```
+
+## Helper Functions
+
+### CLR Transformation
+
+```{r clr_function}
+calc_clr <- function(count_matrix) {
+  mat <- as.matrix(count_matrix)
+
+  # Zero replacement (multiplicative)
+  if (any(mat == 0)) {
+    mat_repl <- zCompositions::cmultRepl(mat,
+      label = 0, method = "CZM",
+      output = "p-counts", suppress.print = TRUE
+    )
+  } else {
+    mat_repl <- mat
+  }
+
+  # CLR: log(x) - mean(log(x)) per row
+  mat_log <- log(mat_repl)
+  mat_clr <- t(apply(mat_log, 1, function(x) x - mean(x)))
+
+  return(mat_clr)
+}
+```
+
+### Aitchison Distance
+
+```{r aitchison_function}
+calc_aitchison <- function(clr_matrix) {
+  dist(clr_matrix, method = "euclidean")
+}
+```
+
+### Feature Filtering
+
+```{r filter_function}
+filter_features <- function(count_matrix) {
+  total_counts <- colSums(count_matrix)
+  presence <- colSums(count_matrix > 0)
+  keep <- (total_counts >= 10) & (presence >= 3)
+  return(count_matrix[, keep, drop = FALSE])
+}
+```
+### Taxonomy Correction (GTDB)
+
+```{r taxonomy_fix_function}
+correct_gtdb_taxonomy <- function(df) {
+  # Define known GTDB Archaeal Phyla to fix mislabeling
+  gtdb_archaea_phyla <- c(
+    "Aenigmatarchaeota", "Altiarchaeota", "Asgardarchaeota",
+    "Crenarchaeota", "Halobacteriota", "Methanobacteriota",
+    "Thermoplasmatota", "Thermoproteota", "Micrarchaeota",
+    "Nanoarchaeota", "Iainarchaeota", "Huberarchaeota",
+    "Undinarchaeota", "Nanohaloarchaeota"
+  )
+
+  # Ensure columns exist
+  if (!all(c("source", "phylum", "kingdom") %in% colnames(df))) {
+    warning("Dataframe missing required columns (source, phylum, kingdom). Returning original.")
+    return(df)
+  }
+
+  df %>%
+    dplyr::mutate(
+      # 1. Assign Domain (Strict)
+      domain = dplyr::case_when(
+        # GTDB: Bacteria or Archaea
+        source == "GTDB" & (phylum %in% gtdb_archaea_phyla | grepl(paste(gtdb_archaea_phyla, collapse = "|"), lineage)) ~ "Archaea",
+        source == "GTDB" ~ "Bacteria",
+
+        # NT Manual Fixes/Inferences
+        source == "NT" & grepl("Filasterea|Choanoflagellata|Ichthyosporea", lineage) ~ "Eukaryota",
+        source == "NT" & (kingdom %in% c("Fungi", "Metazoa", "Viridiplantae") | grepl("k__Fungi|k__Metazoa|k__Viridiplantae", lineage)) ~ "Eukaryota",
+
+        # NT: Extract d__ if present
+        source == "NT" & grepl("d__", lineage) ~ sub(".*d__([^|]+).*", "\\1", lineage),
+        # Fallback for standard domains if d__ missing
+        source == "NT" & kingdom %in% c("Bacteria", "Archaea", "Viruses") ~ kingdom,
+        TRUE ~ "Unclassified"
+      ),
+
+      # 2. Assign Kingdom (Hybrid: Kingdom or Domain-as-Kingdom)
+      kingdom = dplyr::case_when(
+        # GTDB: Duplicate Domain
+        source == "GTDB" ~ domain,
+
+        # NT Manual Fixes
+        source == "NT" & grepl("Filasterea|Choanoflagellata|Ichthyosporea", lineage) ~ "Protista",
+
+        # NT: Prefer k__ if present
+        source == "NT" & grepl("k__", lineage) ~ sub(".*k__([^|]+).*", "\\1", lineage),
+
+        # NT Fallback: If k__ missing, use d__ (Domain) as Kingdom
+        source == "NT" & grepl("d__", lineage) ~ sub(".*d__([^|]+).*", "\\1", lineage),
+
+        # NT Fallback: Use existing non-empty Value (even if Domain-like)
+        source == "NT" & kingdom != "" & !is.na(kingdom) ~ kingdom,
+        TRUE ~ "Unclassified"
+      )
+    )
+}
+```
+
+## Save Objects
+
+```{r save}
+saveRDS(metadata, file.path(RESULTS_DIR, "metadata.rds"))
+saveRDS(group4_colors, file.path(RESULTS_DIR, "group4_colors.rds"))
+message("Setup complete.")
+```
